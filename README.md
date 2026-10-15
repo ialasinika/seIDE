@@ -100,6 +100,14 @@ future work, not present work.
 Extension = fork and edit source. There is no plugin loading, no manifest, no
 discovery and no sandbox.
 
+`subsystems/` (completion, diagnostics, formatters, language servers) is not an
+exception to this. It is a *layer* in this repository — descriptors and modules
+that are reviewed, built and tested with the rest of the source — with a frozen
+wire so a capability never becomes a method the kernel has to know. Nothing is
+downloaded, registered or resolved at run time, and no stability is promised to
+code this project does not own. See
+[`docs/SUBSYSTEMS.md`](docs/SUBSYSTEMS.md).
+
 What there *is* is one hook for new card kinds, because "a card is a file with a
 cursor" is the assumption most likely to make a fork expensive. The kernel
 stores whatever document the shell hands it, verbatim, and the shell's board
@@ -367,6 +375,13 @@ langs/                  language support, deliberately OUTSIDE the kernel
   selftest.mjs          node langs/selftest.mjs -- no kernel needed
   README.md             the descriptor grammar and wire shapes
 
+subsystems/             capability outside the kernel, owned by the shell
+  words.sub             the built-in: completion and diagnostics on any file
+  words.mjs             its implementation -- no server, no network, no config
+  host.mjs              descriptors, lifecycle, request routing, the channel seam
+  selftest.mjs          node subsystems/selftest.mjs -- no kernel, no browser
+  README.md             the descriptor grammar, the wire, the seam
+
 shell/                  the front end and the endpoints
   main.mjs              `seide rpc` (stdio) and `seide serve` (HTTP + SSE + browser)
   web/                  the board UI: index.html, style.css, board.mjs, cards.mjs,
@@ -391,9 +406,9 @@ forks/                  worked forks the release pipeline knows about
 examples/               hello.bf and shadow.bf (Brainfuck), page.html (every
                         SGML token kind), hello.xml, notes.svg, and board.json --
                         the starter board `tools/demo.py` installs
-docs/                   PARADIGM.md, VIEWS.md, ARCHITECTURE.md, PROTOCOL.md,
-                        SURFACES.md, PROJECT.md, TRIM.md, FORK.md, BUGS.md,
-                        RELEASING.md
+docs/                   PARADIGM.md, VIEWS.md, SUBSYSTEMS.md, ARCHITECTURE.md,
+                        PROTOCOL.md, SURFACES.md, PROJECT.md, TRIM.md, FORK.md,
+                        BUGS.md, RELEASING.md
 ```
 
 Build artefacts (`build/`, and the workspace-local `.seide/`) are ignored by

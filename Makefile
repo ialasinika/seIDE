@@ -142,11 +142,12 @@ release:
 	$(PYTHON) tools/release.py
 
 # Everything the project can prove about itself without a window: the C JSON
-# codec, the language layer, the browser modules, the fixed bugs, the second
-# client, the version copies, and both protocol modes.
+# codec, the language layer, the subsystem host, the browser modules, the fixed
+# bugs, the second client, the version copies, and both protocol modes.
 test: check fullcheck probe cli-check version-check $(JSONTEST)
 	$(JSONTEST)
 	$(NODE) langs/selftest.mjs
+	$(NODE) subsystems/selftest.mjs
 	$(NODE) shell/web/selftest.mjs
 
 modules: $(BIN)

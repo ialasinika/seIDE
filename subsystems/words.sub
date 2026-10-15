@@ -1,0 +1,8 @@
+# seIDE subsystem descriptor
+id words
+title Words
+kind builtin
+module words.mjs
+capabilities completion diagnostics
+autostart yes
+description completion from the words at hand, and syntax diagnostics that need no server

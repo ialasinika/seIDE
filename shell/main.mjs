@@ -23,6 +23,10 @@
  * Design note: language support is loaded with a *dynamic* import inside a
  * try/catch.  `rm -rf langs/` must leave a shell that still starts and still
  * serves the board -- it just renders plain text.
+ *
+ * `subsystems/` is a sibling of `langs/` on the same terms: the shell owns the
+ * subsystem host, and a subsystem the host cannot load is reported and skipped
+ * rather than taking the shell down.
  */
 
 import { spawn } from "node:child_process";
@@ -34,10 +38,13 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { SubsystemError, SubsystemHost, loadSubsystems } from "../subsystems/host.mjs";
+
 const SHELL_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.dirname(SHELL_DIR);
 const WEB_DIR = path.join(SHELL_DIR, "web");
 const LANGS_DIR = path.join(ROOT, "langs");
+const SUBSYSTEMS_DIR = path.join(ROOT, "subsystems");
 
 const SHELL_VERSION = "0.3.0-alpha.1";
 const DEFAULT_KERNEL = process.platform === "win32"
@@ -420,10 +427,11 @@ function failure(id, code, name, message, data) {
  *
  * Methods the shell owns:
  *   lang.list, lang.tokenize            served from langs/, no kernel involved
+ *   subsystem.list/start/stop/request   served from subsystems/, same terms
  *   workspace.info                      the kernel's answer plus `langs`
  * Everything else is forwarded verbatim.
  */
-export async function dispatch(frame, kernel, languages) {
+export async function dispatch(frame, kernel, languages, subsystems = null) {
   if (frame === null || typeof frame !== "object" || Array.isArray(frame)) {
     return failure(null, -32600, "INVALID_REQUEST", "a frame must be a JSON object");
   }
@@ -457,6 +465,41 @@ export async function dispatch(frame, kernel, languages) {
       })));
     }
 
+    // Subsystems are the shell's, exactly like the language layer: the kernel
+    // knows about files, documents and processes, and a language server is
+    // none of its business.  A shell built without a host still answers
+    // `subsystem.list` -- with nothing in it -- so a client never has to
+    // guess whether the method exists.
+    if (method.startsWith("subsystem.")) {
+      if (subsystems === null) {
+        if (method === "subsystem.list") return answer(() => response(id, { subsystems: [] }));
+        return answer(() => failure(id, -32601, "METHOD_NOT_FOUND", `${method} needs a shell with a subsystem host`));
+      }
+      if (method === "subsystem.list") {
+        return answer(() => response(id, { subsystems: subsystems.list() }));
+      }
+      if (method === "subsystem.start" || method === "subsystem.stop") {
+        if (typeof params.id !== "string" || params.id === "") {
+          return answer(() => failure(id, -32602, "INVALID_PARAMS", `${method} needs a string \`id\``));
+        }
+        const result = method === "subsystem.start"
+          ? await subsystems.start(params.id, params.params ?? {})
+          : await subsystems.stop(params.id);
+        return answer(() => response(id, result));
+      }
+      if (method === "subsystem.request") {
+        if (typeof params.id !== "string" || params.id === "") {
+          return answer(() => failure(id, -32602, "INVALID_PARAMS", "subsystem.request needs a string `id`"));
+        }
+        if (typeof params.method !== "string" || params.method === "") {
+          return answer(() => failure(id, -32602, "INVALID_PARAMS", "subsystem.request needs a string `method`"));
+        }
+        const result = await subsystems.request(params.id, params.method, params.params ?? {});
+        return answer(() => response(id, result));
+      }
+      return answer(() => failure(id, -32601, "METHOD_NOT_FOUND", `no such method: ${method}`));
+    }
+
     const result = await kernel.call(method, frame.params);
 
     // The kernel is language-agnostic, so the language inventory is added by
@@ -478,9 +521,15 @@ export async function dispatch(frame, kernel, languages) {
 
     return answer(() => response(id, result));
   } catch (err) {
-    const rpc = err instanceof RpcError
-      ? err
-      : new RpcError({ code: -32603, name: "SHELL_ERROR", message: err && err.message }, method);
+    // Errors a subsystem raises are already protocol-shaped (code + name);
+    // anything else becomes a shell error rather than leaking a stack.
+    if (err instanceof RpcError) {
+      return answer(() => failure(id, err.code, err.rpcName, err.message, err.data));
+    }
+    if (err instanceof SubsystemError || (err && typeof err.code === "number" && typeof err.rpcName === "string")) {
+      return answer(() => failure(id, err.code, err.rpcName, err.message));
+    }
+    const rpc = new RpcError({ code: -32603, name: "SHELL_ERROR", message: err && err.message }, method);
     return answer(() => failure(id, rpc.code, rpc.rpcName, rpc.message, rpc.data));
   }
 }
@@ -508,6 +557,12 @@ async function runRpc(options) {
   const languages = await loadLanguages(LANGS_DIR, (message) => {
     process.stderr.write(`[shell] ${message}\n`);
   });
+  const subsystems = new SubsystemHost({
+    descriptors: loadSubsystems(SUBSYSTEMS_DIR, (message) => {
+      process.stderr.write(`[shell] ${message}\n`);
+    }),
+    onEvent: (event) => writeStdout(event),
+  });
 
   await kernel.start();
   if (options.verbose) {
@@ -531,12 +586,13 @@ async function runRpc(options) {
 
       // Sequential on purpose: the kernel answers one frame at a time, and a
       // client that pipelines still gets its replies in order.
-      const reply = await dispatch(frame, kernel, languages);
+      const reply = await dispatch(frame, kernel, languages, subsystems);
       if (reply !== null) writeStdout(reply);
     }
   } finally {
     // Whatever ends the loop -- EOF, an error, a signal -- the kernel child
-    // goes with it.
+    // goes with it, and so does anything a subsystem started.
+    void subsystems.stopAll().catch(() => {});
     kernel.close();
   }
 
@@ -657,8 +713,9 @@ async function runServe(options) {
 
   const subscribers = new Set();
 
-  // Every notification the kernel emits is fanned out to the SSE clients.
-  kernel.onNotification((event) => {
+  // Every notification -- from the kernel or from a subsystem -- is fanned out
+  // to the SSE clients on the same channel, so a client needs one stream.
+  const broadcast = (event) => {
     const line = `data: ${JSON.stringify(event)}\n\n`;
     for (const res of subscribers) {
       try {
@@ -667,6 +724,15 @@ async function runServe(options) {
         subscribers.delete(res);
       }
     }
+  };
+
+  kernel.onNotification(broadcast);
+
+  const subsystems = new SubsystemHost({
+    descriptors: loadSubsystems(SUBSYSTEMS_DIR, (message) => {
+      process.stderr.write(`[shell] ${message}\n`);
+    }),
+    onEvent: broadcast,
   });
 
   const server = createServer((req, res) => {
@@ -736,7 +802,7 @@ async function runServe(options) {
         return;
       }
 
-      const reply = await dispatch(frame, kernel, languages);
+      const reply = await dispatch(frame, kernel, languages, subsystems);
       // A notification is answered with 204: HTTP always needs a status, but
       // there is no response frame to give.
       if (reply === null) {
@@ -799,6 +865,9 @@ async function runServe(options) {
         /* ignore */
       }
     }
+    // A subsystem that is still starting gets one turn to stop; the process is
+    // about to end either way.
+    void subsystems.stopAll().catch(() => {});
     for (const res of subscribers) {
       try {
         res.end();
@@ -841,6 +910,10 @@ async function runServe(options) {
   process.stdout.write(`  kernel  ${kernel.exe}\n`);
   process.stdout.write(`  root    ${kernel.workspace}\n`);
   process.stdout.write(`  langs   ${languages.available ? LANGS_DIR : "(none -- plain text)"}\n`);
+  const known = subsystems.list();
+  process.stdout.write(`  subsys  ${known.length === 0
+    ? "(none -- no subsystems/)"
+    : known.map((s) => `${s.id} (${s.state})`).join(", ")}\n`);
 
   if (!options.noOpen) {
     browser = openWindow(url, options);
@@ -868,14 +941,16 @@ usage: node shell/main.mjs <command> [options]
 
   rpc     [--workspace DIR] [--kernel PATH] [--timeout-ms N] [--verbose]
           Speak newline-delimited JSON-RPC on stdin/stdout.  Forwards to the
-          kernel; answers lang.list and lang.tokenize from langs/; adds the
+          kernel; answers lang.list and lang.tokenize from langs/; answers
+          subsystem.list/start/stop/request from subsystems/; adds the
           \`langs\` member to workspace.info.
 
   serve   [--workspace DIR] [--kernel PATH] [--port N] [--no-open]
           [--timeout-ms N] [--verbose]
           Serve shell/web/ over HTTP with POST /rpc and GET /events, then
           launch the system browser in --app= mode.  --port 0 (default) picks
-          a free port; --no-open skips the browser.
+          a free port; --no-open skips the browser.  Kernel and subsystem
+          notifications share the one event stream.
 
   help    This text.
 
