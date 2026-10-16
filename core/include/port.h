@@ -19,6 +19,7 @@
 #define SEIDE_PORT_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include "buf.h"
 #include "vec.h"
 
@@ -56,23 +57,61 @@ int sde_port_stderr_write(const char *data, size_t len);
 /* files                                                                  */
 /* ====================================================================== */
 
-/* 0 on success, -1 on failure.  `out` is *appended* to. */
+/*
+ * 0 on success, -1 on failure.  `out` is *appended* to.
+ *
+ * Writes are published atomically: the bytes go to a neighbour of `path` and
+ * are moved into place, so a reader -- or a crash, or a full disk -- sees the
+ * whole old file or the whole new one, never a truncated one.
+ */
 int  sde_port_read_file(const char *path, sde_buf *out, char *err, size_t errcap);
 int  sde_port_write_file(const char *path, const char *data, size_t len,
                          char *err, size_t errcap);
 
+/*
+ * Reads at most `len` bytes starting at `offset`, *appending* them to `out`
+ * (which is never cleared).  `offset` is 64-bit because a file can exceed the
+ * 2 GiB a 32-bit seek can reach.
+ *
+ * Returns the number of bytes read -- 0 at or past the end, and short when the
+ * file ends before `len` -- or -1 with `err` filled in.  The bytes are raw: NUL
+ * and every other value comes back unchanged.  When `out_size` is not NULL it
+ * receives the file's size as measured after the read.
+ */
+int64_t sde_port_read_at(const char *path, int64_t offset, size_t len,
+                         sde_buf *out, int64_t *out_size,
+                         char *err, size_t errcap);
+
+/*
+ * Appends `len` bytes to `path`, creating it when it is not there.  With `len`
+ * 0 the file is still created if missing -- that is how a caller starts an
+ * empty file -- and nothing is written.
+ *
+ * Deliberately *not* atomic: the caller writes a temporary neighbour of the
+ * real target and publishes it with sde_port_replace_file().  Use
+ * sde_port_write_file() for a file that is the target itself.
+ */
+int  sde_port_append_file(const char *path, const char *data, size_t len,
+                          char *err, size_t errcap);
+
 int  sde_port_file_exists(const char *path);
 int  sde_port_is_dir(const char *path);
-long sde_port_file_size(const char *path);   /* -1 if it cannot be read */
-long sde_port_file_mtime(const char *path);  /* -1 if it cannot be read */
+
+/*
+ * A size, in bytes, or -1 if it cannot be read.  int64_t rather than long:
+ * Windows' long is 32 bits, so a file past 4 GiB would otherwise report a
+ * wrapped number -- and a wrapped number can look small enough to read.
+ */
+int64_t sde_port_file_size(const char *path);
+long sde_port_file_mtime(const char *path);       /* -1 if it cannot be read */
 
 int  sde_port_mkdirs(const char *path, char *err, size_t errcap);
 int  sde_port_remove_file(const char *path);
 
 /*
- * Atomically replaces `to` with `from`.  `from` is consumed whether or not
- * the replacement succeeds.  Used to publish a new document without
- * ever leaving a truncated one behind.
+ * Atomically replaces `to` with `from`, on one volume or across two.  On
+ * failure `from` is left in place and `to` is untouched, so the caller still
+ * owns the only complete copy and decides what to do with it.
  */
 int  sde_port_replace_file(const char *from, const char *to);
 
@@ -84,9 +123,9 @@ char *sde_port_strdup(const char *s);
 /* ====================================================================== */
 
 typedef struct sde_dirent {
-    char *name;    /* malloc'd; never "." or ".." */
-    int   is_dir;
-    long  size;
+    char      *name;    /* malloc'd; never "." or ".." */
+    int        is_dir;
+    int64_t    size;    /* 64-bit: a directory entry can exceed 4 GiB */
 } sde_dirent;
 
 /*
@@ -105,6 +144,11 @@ int   sde_port_path_is_abs(const char *p);
 char *sde_port_path_norm(const char *p);                    /* malloc'd */
 char *sde_port_path_join(const char *a, const char *b);     /* malloc'd */
 char *sde_port_path_abs(const char *p);                     /* malloc'd */
+/*
+ * 1 when `p` is at or under `root`.  The comparison is lexical first, then
+ * physical: a junction, symlink or 8.3 short name inside the root can point
+ * outside it, and only the resolved path shows that.
+ */
 int   sde_port_path_within(const char *root, const char *p);
 
 /* Exposed because the path logic is worth unit-testing on its own. */

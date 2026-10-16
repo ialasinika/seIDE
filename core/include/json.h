@@ -20,6 +20,14 @@
 #include <stddef.h>
 #include "buf.h"
 
+/*
+ * The nesting limit.  The reader checks it for every value it parses, so a
+ * document may nest at most SDE_JSON_MAX_DEPTH - 1 containers; the writer
+ * refuses a tree at exactly the same point, so what the reader accepts the
+ * writer can write, and neither can be made to recurse without limit.
+ */
+#define SDE_JSON_MAX_DEPTH 64
+
 typedef enum sde_json_type {
     SDE_JSON_NULL = 0,
     SDE_JSON_BOOL,

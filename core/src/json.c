@@ -13,8 +13,6 @@
 
 #include "json.h"
 
-#define SDE_JSON_MAX_DEPTH 64
-
 /* ====================================================================== */
 /* construction / destruction                                             */
 /* ====================================================================== */
@@ -244,7 +242,15 @@ int sde_json_push(sde_json *a, sde_json *v)
         return -1;
     }
     if (a->nelems == a->cvals) {
-        size_t want = (a->cvals == 0) ? 8 : a->cvals * 2;
+        size_t want;
+
+        if (a->cvals > ((size_t) -1) / 2u / sizeof(sde_json *)) {
+            return -1;
+        }
+        want = (a->cvals == 0) ? 8 : a->cvals * 2;
+        if (want > ((size_t) -1) / sizeof(sde_json *)) {
+            return -1;
+        }
         grown = (sde_json **) realloc(a->elems, want * sizeof(sde_json *));
         if (grown == NULL) {
             return -1;
@@ -312,10 +318,18 @@ int sde_json_set(sde_json *o, const char *key, sde_json *v)
     }
 
     if (o->nvals == o->cvals) {
-        size_t        want = (o->cvals == 0) ? 8 : o->cvals * 2;
+        size_t        want;
         char       **gk;
         sde_json   **gv;
 
+        if (o->cvals > ((size_t) -1) / 2u) {
+            return -1;
+        }
+        want = (o->cvals == 0) ? 8 : o->cvals * 2;
+        if (want > ((size_t) -1) / sizeof(char *)
+            || want > ((size_t) -1) / sizeof(sde_json *)) {
+            return -1;
+        }
         gk = (char **) realloc(o->keys, want * sizeof(char *));
         if (gk == NULL) {
             return -1;
@@ -1030,6 +1044,17 @@ static int jw_value(sde_buf *out, const sde_json *v, int indent, int level)
 {
     size_t i;
 
+    /*
+     * The reader refuses a value sitting at SDE_JSON_MAX_DEPTH or deeper --
+     * one check per value, so the deepest document it accepts nests
+     * SDE_JSON_MAX_DEPTH - 1 containers.  The writer refuses at exactly the
+     * same point, which is what keeps the two sides telling the same story
+     * about what is a document.
+     */
+    if (level >= SDE_JSON_MAX_DEPTH) {
+        return -1;
+    }
+
     if (v == NULL) {
         return sde_buf_adds(out, "null");
     }
@@ -1123,10 +1148,15 @@ int sde_json_write(sde_buf *out, const sde_json *v)
  * `links`, compute different revisions for it and hand each other a spurious
  * STALE_REVISION.
  */
-static int jw_canonical(sde_buf *out, const sde_json *v)
+static int jw_canonical_at(sde_buf *out, const sde_json *v, int level)
 {
     size_t i;
     size_t j;
+
+    /* Same promise as jw_value(): refuse a tree the reader would refuse. */
+    if (level >= SDE_JSON_MAX_DEPTH) {
+        return -1;
+    }
 
     if (v == NULL) {
         return sde_buf_adds(out, "null");
@@ -1156,7 +1186,7 @@ static int jw_canonical(sde_buf *out, const sde_json *v)
             if (i > 0 && sde_buf_addc(out, ',') != 0) {
                 return -1;
             }
-            if (jw_canonical(out, v->elems[i]) != 0) {
+            if (jw_canonical_at(out, v->elems[i], level + 1) != 0) {
                 return -1;
             }
         }
@@ -1204,7 +1234,7 @@ static int jw_canonical(sde_buf *out, const sde_json *v)
                     rc = sde_buf_addc(out, ':');
                 }
                 if (rc == 0) {
-                    rc = jw_canonical(out, v->vals[at]);
+                    rc = jw_canonical_at(out, v->vals[at], level + 1);
                 }
             }
             free(order);
@@ -1216,6 +1246,11 @@ static int jw_canonical(sde_buf *out, const sde_json *v)
     }
 
     return -1;
+}
+
+static int jw_canonical(sde_buf *out, const sde_json *v)
+{
+    return jw_canonical_at(out, v, 0);
 }
 
 int sde_json_write_canonical(sde_buf *out, const sde_json *v)

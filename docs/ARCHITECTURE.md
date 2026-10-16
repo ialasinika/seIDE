@@ -119,17 +119,19 @@ builds and runs without it.
 | `buf` | growable byte buffer, the kernel's only string type | nothing builds: every other module formats through it | no |
 | `vec` | growable pointer array, used for lists without a fixed bound | nothing builds | no |
 | `json` | JSON parse/serialise; the protocol's value type | nothing builds | no |
+| `base64` | base64, for the byte strings a JSON string cannot carry | binary bodies have no wire representation; text is unaffected | yes |
 | `port` | the platform boundary: files, paths, threads, processes | nothing builds; this is the layer a fork replaces to leave Win32 | no |
 | `wksp` | workspace reads/writes, path containment, content revisions | files can no longer be opened or saved; only the canvas remains | yes |
+| `blob` | chunked binary and large-file sessions: read, append, atomic publish | only whole text files under 4 MiB can be read or written | yes |
 | `view` | the client's view document: opaque JSON, atomic persistence, revisions | no document survives a restart; the client is left with what it holds | yes |
 | `proc` | child processes as duplex channels: start, write, close, stream | nothing can run: runners and process subsystems stop | yes |
 | `serve` | newline-delimited JSON-RPC over stdin/stdout | the kernel has no way in; useful only as a linkable library | yes |
 | `rpc` | the method table that turns frames into actions | nothing is callable; keep it and the kernel has no verbs | no |
 | `app` | constructs and owns the shared state modules are handed | nothing builds | no |
 
-Ten modules. Six required (`buf`, `vec`, `json`, `port`, `rpc`, `app`), four
-optional (`wksp`, `view`, `proc`, `serve`). Beyond the module table there are
-two compile-time switches in `core/include/seide_cfg.h`:
+Twelve modules. Six required (`buf`, `vec`, `json`, `port`, `rpc`, `app`), six
+optional (`base64`, `wksp`, `blob`, `view`, `proc`, `serve`). Beyond the module
+table there are two compile-time switches in `core/include/seide_cfg.h`:
 
 ```c
 /* Compile-time switches a fork flips to cut whole subsystems out. */
@@ -278,6 +280,9 @@ The Makefile's verification targets, in the order `make test` runs them:
 | `cli-check` | `python tools/seide_cli.py selfcheck` | the protocol's second consumer: eight checks -- hello, a write round-trip, the stale-revision rail, the listing, a document the kernel stores without reading it (and the stale write it refuses), a child's input, output and exit code all crossing one channel, that a shell-only method is still `METHOD_NOT_FOUND`, and that the command line refuses to overwrite a file it was not given a base revision for |
 | `version-check` | `python tools/version.py check` | one version, one changelog section: the copies in `seide_cfg.h` and `shell/main.mjs` |
 | `$(JSONTEST)` | `core/tests/test_json.c`, built against `json.o`/`buf.o`/`vec.o` | the JSON codec everything else trusts |
+| `$(CORETEST)` | `core/tests/test_core.c`, built against the same objects | the containers and the codec's edge: a buffer growth that cannot be represented is refused untouched, a doubling that would wrap does not spin, a 4000-document fuzz corpus parses and round-trips, and the JSON nesting limit holds on both sides — the deepest document the reader accepts (63 nested containers) is one the writer can write, and one past it is refused by both |
+| `$(PORTTEST)` | `core/tests/test_port.c`, built against `port/*.c` | the OS seam, which had no C test before: containment (inside, `..` escape, absolute path, a sibling with the root's name as a prefix), a real directory junction inside the workspace pointing out of it is refused while the same listing without it passes, `sde_port_mkdirs` returning zero for a path that already exists, write-then-read round-trip, a write that publishes atomically and leaves no `.tmp` behind, listing sizes and `sde_mutex_new` succeeding/failing |
+| `$(BLOBTEST)` | `core/tests/test_blob.c`, built against the whole kernel except `main.c` | the binary/large-file sessions, 129 checks: base64 padding and alphabet strictness plus a round trip of all 256 byte values, a 1 MiB + 300 + 2 byte file published atomically with the revision `file.read` reports, the 1 MiB chunk limit, a stale `base_revision` refused with the current revision and nothing left on disk, read sessions (sequential chunks, an explicit offset that moves the cursor, an offset past the end clamped to the end, one-byte reads), a refused commit that keeps the session and its temporary, one writer per target path, the eight-session table, a 5 MiB file that `file.read` still refuses while the session layer reads and hashes it, a shutdown that removes a temporary a client left open, and the five `file.blob*` handlers through `sde_rpc_handle` — their method names, the codes they refuse with, the base64 a client sends, and the `file.changed` a commit emits |
 | — | `node langs/selftest.mjs` | 92 descriptor/tokenizer checks, both families, no kernel, no browser |
 | — | `node subsystems/selftest.mjs` | 114 checks of the subsystem layer: the descriptor grammar and its rejections, the host's lifecycle (states, autostart, shared starts, failures, timeouts, stop-all, and a stop followed by a question), the channel seam, `words` completion and diagnostics incl. the tokenizer's quieting, the `lsp` adapter's framing helpers, and that adapter against a real child running `lsp-stub.mjs` — no kernel, no browser, no network |
 | — | `node shell/web/selftest.mjs` | 130 checks of the protocol plumbing, board model (including the selection set, a group move/delete being one change each, and the frame's centre-inside membership and margin arithmetic), token spans, the editor's indent/find/replace arithmetic, the language client (which subsystem answers a capability, the prefix and ranking arithmetic, LSP ranges into line/column, diagnostics normalised from either shape, and that a shell with no subsystems is asked exactly once), the workspace search's line/column, excerpt and budget arithmetic, the undo ring and the wheel rule's arithmetic, the watcher's decision table (a clean card adopts, a dirty card is warned, an incomparable revision never reloads, one piece of news is reported once, and a kernel that answers `METHOD_NOT_FOUND` is trimmed rather than broken), and the classic view's roles and tile (the project panel wins the sidebar, the active editor holds the code area, hidden covers the rest, and the tile leaves no gap or overlap inside the viewport at four sizes), no DOM |
@@ -312,9 +317,13 @@ up; `docs/RELEASING.md` is the policy.
   That is exactly the behaviour a closing window needs.
 - **One reader thread per child process.** Rejected in favour of a single
   15 ms polling pump, to keep the kernel single-writer (see above).
-- **Binary files as JSON strings.** `wksp` refuses to read a file containing a
-  NUL byte ("file is binary") because shipping it as a JSON string would produce
-  a document no client can round-trip.
+- **Binary files as JSON strings.** `file.read` refuses to read a file containing
+  a NUL byte ("file is binary") because shipping it as a JSON string would
+  produce a document no client can round-trip. The answer is the `file.blob*`
+  session instead, where the bytes travel as base64 and never become text
+  (`docs/PROTOCOL.md`); it lifts the 4 MiB `file.read` cap for the same reason,
+  since a session streams the file in chunks instead of holding it in one
+  string.
 - **A missing or corrupt view document.** Neither is the kernel's problem any
   more. An absent `.seide/board.json` is fine (first run: `document: null`,
   `revision: 0`), and a file that **exists but does not parse** is reported to

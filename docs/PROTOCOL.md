@@ -83,7 +83,7 @@ responses at any time. The event list is below.
 ## The kernel method table
 
 The authoritative table is `sde_methods[]` in `core/src/rpc.c`. With both
-compile-time switches on (`SDE_WITH_VIEW`, `SDE_WITH_PROC`) there are thirteen
+compile-time switches on (`SDE_WITH_VIEW`, `SDE_WITH_PROC`) there are eighteen
 methods. `view.*` disappears when `SDE_WITH_VIEW` is 0; `proc.*` disappears
 when `SDE_WITH_PROC` is 0.
 
@@ -95,6 +95,11 @@ when `SDE_WITH_PROC` is 0.
 | `file.read` | `path` | `{path, text, revision, eol, size, mtime}` (+ `lang` from the shell) |
 | `file.write` | `path`, `text`, `base_revision?` | `{path, revision, eol, size}` |
 | `file.stat` | `path` | `{path, exists, dir, size, mtime, revision}` |
+| `file.blobOpen` | `path`, `mode`, `base_revision?`, `want_revision?` | `{session, path, size, revision?}` |
+| `file.blobRead` | `session`, `offset?`, `length?` | `{session, offset, size, eof, data}` |
+| `file.blobAppend` | `session`, `data`, `offset?` | `{session, offset, size}` |
+| `file.blobCommit` | `session`, `total_size` | `{path, size, revision, replaced}` |
+| `file.blobAbort` | `session` | `{aborted}` |
 | `view.load` | `path` | `{path, revision, document}` |
 | `view.save` | `path`, `document`, `base_revision?` | `{path, revision, saved}` |
 | `proc.start` | `cmd`, `cwd?` | `{run_id}` |
@@ -271,6 +276,16 @@ A client that finds `revision: 0` where it expected a number must read it as
 "cannot tell", never as "unchanged" or "empty". The shell's watcher warns about
 such a card instead of reloading over it.
 
+`file.write` reads the same value, and refuses when it cannot. If the file on
+disk exists but the kernel cannot read it to compute a revision (a permission or
+I/O failure), a write fails with `1003 IO` and the kernel's own message
+(`cannot read the file on disk: <path>`) instead of treating the base as a
+match. Overwriting a file whose bytes the kernel cannot compare is exactly the
+lost update `base_revision` exists to prevent, so "cannot say" must not mean "go
+ahead". A file that *is* readable, including one holding a NUL byte, has a real
+revision: `file.write` compares it, and a client that hands back the `0` it saw
+from `file.stat` gets `1001 STALE_REVISION`, not a silent overwrite.
+
 Everything else is refused exactly as `file.read` refuses it: a missing `path`
 is `-32602 INVALID_PARAMS`, and an absolute path or a `..` escape is
 `1003 IO`. A missing **file**, again, is not a refusal.
@@ -285,6 +300,12 @@ is `-32602 INVALID_PARAMS`, and an absolute path or a `..` escape is
 
 Result: `{"path":"examples/hello.bf","revision":987654321,"eol":"lf","size":1240}`.
 
+The bytes are published atomically: the kernel writes a neighbouring temporary
+file and replaces the target with it, so a reader — or a crash — sees the whole
+old file or the whole new one, never half of one. `view.save` has always done
+this; `file.write` now uses the same port call (`sde_port_write_file`) rather
+than writing in place.
+
 With a `base_revision` that no longer matches the file on disk, the write is
 refused with:
 
@@ -297,6 +318,106 @@ On success the kernel emits a notification **before** the response is written:
 ```json
 {"event":"file.changed","path":"examples/hello.bf","revision":987654321}
 ```
+
+### Binary and large files: blob sessions
+
+`file.read` and `file.write` carry a file inside a JSON string, which puts two
+things out of reach at once: a JSON string cannot carry a NUL byte, and
+`file.read` refuses any file over 4 MiB. The five `file.blob*` methods move the
+bytes through a *session* instead. Same workspace, same path containment, same
+revisions as `file.read` and `file.write`; only the shape of the transfer is
+different.
+
+A session is opened once, used for as many chunks as the file needs, and then
+either published (`file.blobCommit`) or thrown away (`file.blobAbort`). Bytes
+travel in `data` as standard base64 with padding, so a chunk costs 4 characters
+on the wire for every 3 bytes, and one call carries at most 1 048 576 decoded
+bytes. The kernel holds at most eight sessions at once and forgets one that has
+been idle for fifteen minutes; a session that is forgotten takes its temporary
+file with it.
+
+#### `file.blobOpen`
+
+| parameter | type | meaning |
+| --- | --- | --- |
+| `path` | string, required | relative path, resolved exactly as `file.read` resolves it (so `..` and an absolute path are refused) |
+| `mode` | string, required | `"read"` or `"write"`; anything else is `INVALID_PARAMS` |
+| `base_revision` | number, optional | write mode only: the revision the client read. A mismatch is `1001 STALE_REVISION` with `data.current_revision`, and **no** session and no temporary file are created |
+| `want_revision` | boolean, optional | read mode: also hash the file and return its current `revision` |
+
+Result: `{"session":1,"path":"assets/logo.png","size":91234}`, plus
+`"revision":<n>` when `base_revision` or `want_revision` asked for it.
+
+A read session needs the file to exist (`1002 NOT_FOUND` if it does not); a
+write session does not — it writes a neighbouring `<path>.tmp` and creates
+missing parent directories exactly as `file.write` does. Only one write session
+may target a path at a time. The revision is computed *before* the slot is
+taken, so a stale `base_revision` leaves nothing behind.
+
+#### `file.blobRead`
+
+| parameter | type | meaning |
+| --- | --- | --- |
+| `session` | number, required | a session opened with `mode:"read"` |
+| `offset` | number, optional | where to start; default: where the session stopped |
+| `length` | number, optional | how many bytes, 1 to 1 048 576; default: 1 048 576 |
+
+Result: `{"session":1,"offset":0,"size":91234,"eof":false,"data":"<base64>"}`.
+
+`offset` in the result is where the returned bytes begin — which is where the
+session's position was, or the `offset` that was asked for. Asking past the end
+of the file is **not** an error: the answer is clamped to the end, `data` is
+empty and `eof` is `true`. The session's position always becomes
+`offset + bytes returned`, so an explicit `offset` moves the sequential cursor
+too — a client that wants random access should send `offset` on every read. The
+file is re-measured on each read, so a file that grows or shrinks under the
+client is followed rather than misread.
+
+#### `file.blobAppend`
+
+| parameter | type | meaning |
+| --- | --- | --- |
+| `session` | number, required | a session opened with `mode:"write"` |
+| `data` | string, required | base64; decoded it must be at most 1 048 576 bytes |
+| `offset` | number, optional | if present it must equal the bytes written so far |
+
+Result: `{"session":1,"offset":1048576,"size":1048576}`; `offset` and `size` are
+the same number and both are the new total. The first append creates (and
+truncates) `<path>.tmp`; later ones append to it. A chunk that is not valid
+base64 is `INVALID_PARAMS` with `` `data` is not valid base64 ``. The append is
+deliberately *not* atomic: the temporary file is a staging area, and the target
+is only ever replaced by `file.blobCommit`.
+
+#### `file.blobCommit`
+
+| parameter | type | meaning |
+| --- | --- | --- |
+| `session` | number, required | a write session |
+| `total_size` | number, required | the whole file's size; a mismatch is `INVALID_PARAMS` |
+
+Result: `{"path":"assets/logo.png","size":91234,"revision":3901234567,"replaced":true}`.
+
+`total_size` is what makes "the last chunk" a statement rather than a guess: the
+kernel publishes only when it equals the bytes actually written. Publication is
+atomic — the temporary file replaces the target — and the revision reported is
+the same number `file.read` and `file.stat` give for those bytes (FNV-1a over
+them). `file.changed` is emitted before the response, exactly as `file.write`
+emits it. A refused commit does **not** throw the session away: the client may
+send more chunks and commit again.
+
+#### `file.blobAbort`
+
+| parameter | type | meaning |
+| --- | --- | --- |
+| `session` | number, required | any open session |
+
+Result: `{"aborted":true}`. The session is closed and its temporary file
+removed. Aborting a session a second time — or naming a session that never
+existed — is `INVALID_PARAMS` with `no such blob session`.
+
+Not every client will be so tidy: the next `file.blobOpen` on the same path
+removes a `<path>.tmp` left behind by a kernel that died mid-session, and a
+kernel that shuts down removes the temporary files of every session still open.
 
 ### `view.load`
 
@@ -416,7 +537,7 @@ Parameter: `run_id` (number; a non-number is `-32602` with
 
 | event | members | emitted when |
 | --- | --- | --- |
-| `file.changed` | `path`, `revision` | a successful `file.write` |
+| `file.changed` | `path`, `revision` | a successful `file.write` or `file.blobCommit` |
 | `view.changed` | `path`, `revision` | a successful `view.save` |
 | `proc.output` | `run_id`, `stream`, `data` | the pump read bytes from a child |
 | `proc.exit` | `run_id`, `code` | a child exited and every byte was consumed |
@@ -489,8 +610,8 @@ Three things about it are the point:
 
 | code | name | when |
 | --- | --- | --- |
-| 1001 | `STALE_REVISION` | `file.write` or `view.save` with an out-of-date `base_revision`; carries `data.current_revision` |
-| 1002 | `NOT_FOUND` | `file.read` on an absent file; `proc.stop` or `proc.close` on an unknown run |
+| 1001 | `STALE_REVISION` | `file.write`, `file.blobOpen` or `view.save` with an out-of-date `base_revision`; carries `data.current_revision` |
+| 1002 | `NOT_FOUND` | `file.read` or `file.blobOpen` on an absent file; `proc.stop` or `proc.close` on an unknown run |
 | 1003 | `IO` | read/write/list/save failures not covered above |
 | 1004 | *(retired)* | was `INVALID_BOARD`; the kernel no longer validates a document, so nothing emits it. The number stays reserved: a client that reads `1004` from an older kernel is looking at a fork or at `seide/1` |
 | 1005 | `PROC` | a child process could not be started, could not be written to, or its input is closed |

@@ -39,13 +39,23 @@ static void set_err_path(char *err, size_t errcap, const char *message, const ch
     }
 }
 
+/*
+ * A size as JSON.  A file can be larger than a `long` here (MinGW's long is
+ * 32 bits), and a double holds every integer below 2^53 exactly, so a size is
+ * emitted as a number rather than as a truncated long.  For every size a
+ * `long` can hold the bytes on the wire are unchanged.
+ */
+static sde_json *json_size(int64_t v)
+{
+    return sde_json_num((double) v);
+}
+
 /* ====================================================================== */
 /* revisions                                                              */
 /* ====================================================================== */
 
-unsigned long sde_rev_of(const char *data, size_t len)
+unsigned long sde_rev_update(unsigned long h, const char *data, size_t len)
 {
-    unsigned long h = 2166136261UL;
     size_t i;
 
     for (i = 0; i < len; i++) {
@@ -55,24 +65,51 @@ unsigned long sde_rev_of(const char *data, size_t len)
     return h;
 }
 
-/* A file that does not exist has a well-defined revision of 0. */
-static unsigned long rev_of_file(const char *path, char *err, size_t errcap)
+unsigned long sde_rev_final(unsigned long h)
 {
-    sde_buf       buf;
-    unsigned long rev;
+    /*
+     * 0 means "there is no revision to compare" -- an absent, unreadable or
+     * non-text file.  The hash itself can land on 0 (~2^-32 per content), and
+     * a file whose bytes hash to 0 would then be indistinguishable from a
+     * missing one, so that one value is reported as 1.
+     */
+    return (h == 0UL) ? 1UL : h;
+}
 
+unsigned long sde_rev_of(const char *data, size_t len)
+{
+    return sde_rev_final(sde_rev_update(SDE_REV_SEED, data, len));
+}
+
+/*
+ * The revision of the file at `path`.
+ *
+ *    0  *out holds the revision; 0 means the file does not exist, which is
+ *       itself a fact a client compares against
+ *   -1  the file is there but has no revision to give: it could not be read
+ *
+ * Keeping the two apart is the point.  When both reported 0, a write carrying
+ * base 0 -- "I believe there is no file" -- matched an unreadable one and
+ * overwrote it without ever comparing anything.
+ */
+static int rev_of_file(const char *path, unsigned long *out,
+                       char *err, size_t errcap)
+{
+    sde_buf buf;
+
+    *out = 0;
     if (!sde_port_file_exists(path)) {
         return 0;
     }
     sde_buf_init(&buf);
     if (sde_port_read_file(path, &buf, err, errcap) != 0) {
-        set_err(err, errcap, "cannot read file for revision");
+        set_err_path(err, errcap, "cannot read the file on disk", path);
         sde_buf_free(&buf);
-        return 0;
+        return -1;
     }
-    rev = sde_rev_of(buf.data, buf.len);
+    *out = sde_rev_of(buf.data, buf.len);
     sde_buf_free(&buf);
-    return rev;
+    return 0;
 }
 
 /* ====================================================================== */
@@ -333,7 +370,7 @@ static void walk(walk_state *w, const char *abs_dir, const char *rel_dir, int de
                 }
                 sde_json_set(item, "path", sde_json_str(rel));
                 sde_json_set(item, "dir", sde_json_bool(d->is_dir ? 1 : 0));
-                sde_json_set(item, "size", sde_json_int(d->is_dir ? 0 : d->size));
+                sde_json_set(item, "size", json_size(d->is_dir ? 0 : d->size));
                 if (sde_json_push(w->files, item) != 0) {
                     sde_json_free(item);
                     set_err(w->err, w->errcap, "out of memory");
@@ -477,7 +514,7 @@ sde_json *sde_wksp_read(const sde_app *app, const char *rel, char *err, size_t e
         free(abs);
         return NULL;
     }
-    if (sde_port_file_size(abs) > (long) SDE_WKSP_MAX_READ) {
+    if (sde_port_file_size(abs) > (int64_t) SDE_WKSP_MAX_READ) {
         set_err_path(err, errcap, "file is too large to open", rel);
         free(abs);
         return NULL;
@@ -530,7 +567,7 @@ sde_json *sde_wksp_stat(const sde_app *app, const char *rel, char *err, size_t e
     sde_json     *out;
     int           is_dir;
     int           exists;
-    long          size = 0;
+    int64_t       size = 0;
     unsigned long rev = 0;
 
     if (sde_wksp_resolve(app, rel, &abs, err, errcap) != 0) {
@@ -549,7 +586,7 @@ sde_json *sde_wksp_stat(const sde_app *app, const char *rel, char *err, size_t e
          * miss a change.  So the same two refusals apply: a file past the read
          * cap, and a file with a NUL byte in it, have no revision to report.
          */
-        if (size <= (long) SDE_WKSP_MAX_READ) {
+        if (size <= (int64_t) SDE_WKSP_MAX_READ) {
             if (size == 0) {
                 rev = sde_rev_of("", 0);
             } else {
@@ -575,7 +612,7 @@ sde_json *sde_wksp_stat(const sde_app *app, const char *rel, char *err, size_t e
     sde_json_set(out, "path", sde_json_str(rel));
     sde_json_set(out, "exists", sde_json_bool(exists));
     sde_json_set(out, "dir", sde_json_bool(is_dir));
-    sde_json_set(out, "size", sde_json_int(size));
+    sde_json_set(out, "size", json_size(size));
     sde_json_set(out, "mtime",
                  sde_json_int(exists ? sde_port_file_mtime(abs) : -1));
     sde_json_set(out, "revision", sde_json_rev(rev));
@@ -634,13 +671,21 @@ int sde_wksp_write(const sde_app *app, const char *rel, const char *text,
         free(abs);
         return SDE_WKSP_FAIL;
     }
-    if (sde_port_file_size(abs) > (long) SDE_WKSP_MAX_READ) {
+    if (sde_port_file_size(abs) > (int64_t) SDE_WKSP_MAX_READ) {
         set_err_path(err, errcap, "file is too large to overwrite", rel);
         free(abs);
         return SDE_WKSP_FAIL;
     }
 
-    cur = rev_of_file(abs, err, errcap);
+    if (rev_of_file(abs, &cur, err, errcap) != 0) {
+        /*
+         * The file is there but has no revision to compare, so no base can be
+         * proved to match it.  Refusing is the honest answer: overwriting here
+         * would be the lost update optimistic locking exists to prevent.
+         */
+        free(abs);
+        return SDE_WKSP_FAIL;
+    }
     if (cur_rev != NULL) {
         *cur_rev = cur;
     }

@@ -50,6 +50,15 @@ int sde_buf_reserve(sde_buf *b, size_t extra)
     size_t cap;
     char  *grown;
 
+    /*
+     * len + extra + 1 has to be representable.  Nothing here can reach that
+     * with a 64-bit size_t, but the arithmetic is the kind that wraps
+     * silently, and a wrap would turn a size nobody has into a buffer that is
+     * far too small.
+     */
+    if (extra > (size_t) -1 - b->len - 1u) {
+        return -1;
+    }
     need = b->len + extra + 1u;
     if (need <= b->cap) {
         return 0;
@@ -57,6 +66,11 @@ int sde_buf_reserve(sde_buf *b, size_t extra)
 
     cap = (b->cap == 0u) ? SDE_BUF_MIN_CAP : b->cap;
     while (cap < need) {
+        if (cap > ((size_t) -1) / 2u) {
+            /* Doubling would wrap; the requirement itself still fits. */
+            cap = need;
+            break;
+        }
         cap = cap * 2u;
         if (cap < SDE_BUF_MIN_CAP) {
             cap = SDE_BUF_MIN_CAP;

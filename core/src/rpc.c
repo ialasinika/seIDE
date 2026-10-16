@@ -13,6 +13,8 @@
 #include <string.h>
 
 #include "app.h"
+#include "base64.h"
+#include "blob.h"
 #include "json.h"
 #include "port.h"
 #include "proc.h"
@@ -651,6 +653,287 @@ static void h_proc_list(sde_call *c)
 #endif /* SDE_WITH_PROC */
 
 /* ---------------------------------------------------------------------- */
+/* handlers: binary and large files                                        */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * Maps a blob session status onto a JSON-RPC error.  The mapping is most of
+ * the contract: a stale base is 1001 and carries the revision to retry from, a
+ * missing file is 1002, real I/O trouble is 1003, and anything the caller got
+ * wrong about the request is their own -32602.
+ */
+static void fail_blob(sde_call *c, int rc, unsigned long cur, const char *err)
+{
+    sde_json   *d;
+    const char *msg = (err != NULL && err[0] != '\0') ? err
+                                                     : "blob request failed";
+
+    if (rc == SDE_BLOB_STALE) {
+        d = sde_json_obj();
+        if (d != NULL) {
+            sde_json_set(d, "current_revision", sde_json_rev(cur));
+        }
+        fail(c, SDE_RPC_STALE_REVISION, "STALE_REVISION",
+             "file changed on disk since it was read");
+        c->data = d;
+        return;
+    }
+    if (rc == SDE_BLOB_NOTFOUND) {
+        fail(c, SDE_RPC_NOT_FOUND, "NOT_FOUND", "no such file");
+        return;
+    }
+    if (rc == SDE_BLOB_NOSESS) {
+        fail(c, SDE_RPC_INVALID_PARAMS, "INVALID_PARAMS",
+             "no such blob session");
+        return;
+    }
+    if (rc == SDE_BLOB_PARAM) {
+        fail(c, SDE_RPC_INVALID_PARAMS, "INVALID_PARAMS", msg);
+        return;
+    }
+    fail(c, SDE_RPC_IO, "IO", msg);
+}
+
+/* `session` is required, and it must be a number. */
+static int need_session(sde_call *c, long *out)
+{
+    const sde_json *v = sde_json_get(c->params, "session");
+
+    if (v == NULL || v->type != SDE_JSON_NUM) {
+        fail(c, SDE_RPC_INVALID_PARAMS, "INVALID_PARAMS",
+             "`session` is required and must be a number");
+        return -1;
+    }
+    *out = sde_json_as_int(v, 0);
+    return 0;
+}
+
+/*
+ * An optional integer member.  Integers are exact here -- the parser keeps the
+ * digits it saw -- so an offset past 2^53 survives the trip, which matters for
+ * a file large enough to be worth a session in the first place.
+ */
+static int opt_i64(sde_call *c, const char *key, int *has, int64_t *out)
+{
+    const sde_json *v = sde_json_get(c->params, key);
+    char            msg[128];
+
+    *has = 0;
+    *out = 0;
+    if (v == NULL) {
+        return 0;
+    }
+    if (v->type != SDE_JSON_NUM) {
+        snprintf(msg, sizeof(msg), "`%s` must be a number", key);
+        fail(c, SDE_RPC_INVALID_PARAMS, "INVALID_PARAMS", msg);
+        return -1;
+    }
+    if (v->inum) {
+        *out = (int64_t) v->ival;
+    } else {
+        *out = (int64_t) v->nval;
+    }
+    *has = 1;
+    return 0;
+}
+
+static void h_file_blob_open(sde_call *c)
+{
+    char          err[256];
+    const char   *path = NULL;
+    const char   *mode = NULL;
+    int           has_base = 0;
+    int64_t       base_i = 0;
+    int           want_rev = 0;
+    unsigned long cur = 0;
+    sde_json     *res = NULL;
+    int           rc;
+
+    need_string(c, "path", &path);
+    need_string(c, "mode", &mode);
+    if (c->code != 0) {
+        return;
+    }
+    if (opt_i64(c, "base_revision", &has_base, &base_i) != 0) {
+        return;
+    }
+    want_rev = sde_json_getb(c->params, "want_revision", 0);
+
+    err[0] = '\0';
+    rc = sde_blob_open(c->app, c->app->blobs, path, mode, has_base,
+                       (unsigned long) base_i, want_rev, &res, &cur,
+                       err, sizeof(err));
+    if (rc != SDE_BLOB_OK) {
+        sde_json_free(res);
+        fail_blob(c, rc, cur, err);
+        return;
+    }
+    c->owned = res;
+}
+
+static void h_file_blob_read(sde_call *c)
+{
+    char      err[256];
+    long      session = 0;
+    int       has_offset = 0;
+    int       has_length = 0;
+    int64_t   offset = 0;
+    int64_t   length = 0;
+    sde_json *res = NULL;
+    int       rc;
+
+    if (need_session(c, &session) != 0) {
+        return;
+    }
+    if (opt_i64(c, "offset", &has_offset, &offset) != 0) {
+        return;
+    }
+    if (opt_i64(c, "length", &has_length, &length) != 0) {
+        return;
+    }
+
+    err[0] = '\0';
+    rc = sde_blob_read(c->app->blobs, session, has_offset, offset,
+                       has_length, length, &res, err, sizeof(err));
+    if (rc != SDE_BLOB_OK) {
+        sde_json_free(res);
+        fail_blob(c, rc, 0, err);
+        return;
+    }
+    c->owned = res;
+}
+
+static void h_file_blob_append(sde_call *c)
+{
+    char            err[256];
+    long            session = 0;
+    const sde_json *v;
+    const char     *b64;
+    size_t          b64len;
+    char           *raw = NULL;
+    size_t          rawlen = 0;
+    int             has_offset = 0;
+    int64_t         offset = 0;
+    sde_json       *res = NULL;
+    int             rc;
+
+    if (need_session(c, &session) != 0) {
+        return;
+    }
+
+    /*
+     * A chunk travels base64 because a JSON string cannot hold a NUL.  The
+     * encoded size is checked before the decode: a frame over the limit is
+     * refused without allocating four thirds of it first.
+     */
+    v = sde_json_get(c->params, "data");
+    if (v == NULL || v->type != SDE_JSON_STR) {
+        fail(c, SDE_RPC_INVALID_PARAMS, "INVALID_PARAMS",
+             "`data` must be a base64 string");
+        return;
+    }
+    b64 = sde_json_as_str(v);
+    if (b64 == NULL) {
+        b64 = "";
+    }
+    b64len = strlen(b64);
+    if (b64len > (size_t) SDE_BLOB_MAX_CHUNK / 3u * 4u + 4u) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "`data` decodes to more than %d bytes", SDE_BLOB_MAX_CHUNK);
+        fail(c, SDE_RPC_INVALID_PARAMS, "INVALID_PARAMS", msg);
+        return;
+    }
+    if (sde_base64_decode(b64, b64len, &raw, &rawlen) != 0) {
+        fail(c, SDE_RPC_INVALID_PARAMS, "INVALID_PARAMS",
+             "`data` is not valid base64");
+        return;
+    }
+    if (opt_i64(c, "offset", &has_offset, &offset) != 0) {
+        free(raw);
+        return;
+    }
+
+    err[0] = '\0';
+    rc = sde_blob_append(c->app->blobs, session,
+                         raw == NULL ? "" : raw, rawlen,
+                         has_offset, offset, &res, err, sizeof(err));
+    free(raw);
+    if (rc != SDE_BLOB_OK) {
+        sde_json_free(res);
+        fail_blob(c, rc, 0, err);
+        return;
+    }
+    c->owned = res;
+}
+
+static void h_file_blob_commit(sde_call *c)
+{
+    char      err[256];
+    long      session = 0;
+    int       has_total = 0;
+    int64_t   total = 0;
+    sde_json *res = NULL;
+    sde_json *note;
+    int       rc;
+
+    if (need_session(c, &session) != 0) {
+        return;
+    }
+    if (opt_i64(c, "total_size", &has_total, &total) != 0) {
+        return;
+    }
+
+    err[0] = '\0';
+    rc = sde_blob_commit(c->app, c->app->blobs, session, has_total, total,
+                         &res, err, sizeof(err));
+    if (rc != SDE_BLOB_OK) {
+        sde_json_free(res);
+        fail_blob(c, rc, 0, err);
+        return;
+    }
+
+    /* Other viewers of the same workspace need to know. */
+    note = sde_json_obj();
+    if (note != NULL) {
+        const sde_json *p = sde_json_get(res, "path");
+        const sde_json *r = sde_json_get(res, "revision");
+
+        sde_json_set(note, "event", sde_json_str("file.changed"));
+        if (p != NULL) {
+            sde_json_set(note, "path", sde_json_clone(p));
+        }
+        if (r != NULL) {
+            sde_json_set(note, "revision", sde_json_clone(r));
+        }
+        (void) sde_app_notify(c->app, note);
+    }
+
+    c->owned = res;
+}
+
+static void h_file_blob_abort(sde_call *c)
+{
+    char      err[256];
+    long      session = 0;
+    sde_json *res = NULL;
+    int       rc;
+
+    if (need_session(c, &session) != 0) {
+        return;
+    }
+
+    err[0] = '\0';
+    rc = sde_blob_abort(c->app->blobs, session, &res, err, sizeof(err));
+    if (rc != SDE_BLOB_OK) {
+        sde_json_free(res);
+        fail_blob(c, rc, 0, err);
+        return;
+    }
+    c->owned = res;
+}
+
+/* ---------------------------------------------------------------------- */
 /* the table                                                              */
 /* ---------------------------------------------------------------------- */
 
@@ -661,6 +944,11 @@ static const sde_method sde_methods[] = {
     { "file.read",      h_file_read },
     { "file.write",     h_file_write },
     { "file.stat",      h_file_stat },
+    { "file.blobOpen",  h_file_blob_open },
+    { "file.blobRead",  h_file_blob_read },
+    { "file.blobAppend", h_file_blob_append },
+    { "file.blobCommit", h_file_blob_commit },
+    { "file.blobAbort", h_file_blob_abort },
 #if SDE_WITH_VIEW
     { "view.load",      h_view_load },
     { "view.save",      h_view_save },

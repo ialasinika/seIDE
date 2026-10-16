@@ -67,6 +67,7 @@ The cuts a fork usually makes first, in ascending order of pain:
 | cut | effort | what you lose |
 | --- | --- | --- |
 | `langs/` (the whole language layer) | `rm -rf langs/`; the shell falls back automatically | colouring; the editor renders plain text |
+| `blob` (and `base64` with it) | 4 edits + `app.c`; **no shell changes** — nothing in `shell/` calls these methods yet | `file.blob*`: files move as text under 4 MiB again, which is all the shell ever needed |
 | `proc` | 4 edits + `app.c` | `runner` cards, `proc.*` methods and every process subsystem |
 | `view` | 4 edits + `app.c` + heavy shell changes | persistence of the layout — and with it the ability to keep any document at all |
 | `wksp` | 4 edits + the `editor`, `search`, `files` and `project` card kinds | files; the canvas alone remains |

@@ -321,6 +321,83 @@ live in `build/probes/subsystems/`: `FINDINGS.md`, `probe_lsp.mjs`,
   shell's timeout message still says plainly that
   giving up does **not** cancel the call, so a slow kernel is not mistaken for a
   dead one.
+- **N15 — `file.write` was not atomic while `view.save` was.** `core/src/wksp.c`
+  called `sde_port_write_file` on the target itself, so a crash or a full disk
+  half-way through left a partial file whose revision no longer described what
+  the client had read; the board path had always written a neighbour and
+  replaced it (`core/src/view.c`).  The atomic dance now lives in the one place
+  both use: `sde_port_write_file` writes `<path>.tmp` and calls
+  `sde_port_replace_file`, and `view.c` no longer carries a copy of it.
+- **N16 — the replace fallback deleted the file it had just failed to copy.**
+  `sde_port_replace_file` used `MoveFileExA` without `MOVEFILE_COPY_ALLOWED`,
+  which fails across volumes, and its fallback was `CopyFileA` followed by
+  `DeleteFileA(from)` — so when the copy also failed, the only complete copy was
+  gone (and the caller then removed the temp as well).  It is now one
+  `MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)`,
+  which does its own copying, and a failure leaves `from` alone.
+- **N17 — "no revision to compare" and "revision 0" were the same number, and a
+  write could act on it.**  `rev_of_file()` returned 0 both for a file that is
+  not there and for a file it could not read, and `sde_rev_of()` can return 0 by
+  itself, so a client sending `base_revision: 0` could match a file it had never
+  read — the lost update optimistic locking exists to prevent.  `rev_of_file()`
+  now reports the two cases apart, `sde_rev_of()` maps a natural 0 to 1 so the
+  only 0 on the wire means "cannot say" (a `file.stat` of a missing, oversized,
+  NUL-holding or binary file, which is exactly how the shell already reads it),
+  and `sde_wksp_write` refuses a write whose base cannot be compared with
+  `1003 IO` and `cannot read the file on disk: <path>`.  `file.read` refuses an
+  unknown revision the same way.
+- **N18 — the containment check was lexical, so a junction inside the workspace
+  reached outside it.**  `sde_port_path_within` normalized the text, lower-cased
+  it and compared prefixes; `cmd /c mklink /J` made that meaningless.  It now
+  asks Windows for the real path of the workspace root and of the deepest
+  existing ancestor of the target (`GetFinalPathNameByHandleW` plus
+  `GetLongPathNameW`) and requires the answer to be inside the root, so a path
+  the kernel cannot resolve is refused rather than assumed safe.
+  `core/tests/test_port.c` creates a real junction and asserts both halves.
+- **N19 — sizes over 4 GiB were silently truncated, and a long path listed a
+  directory that is not the one asked for.**  `sde_port_file_size` returned
+  `long`, `sde_dirent.size` was a `long`, and the listing took only
+  `nFileSizeLow`; the listing pattern was built with `snprintf`, whose
+  truncation was checked only for `< 0`.  Sizes are `int64_t`/`long long`
+  everywhere now (`sde_port_file_size`, `sde_dirent.size`, and the kernel's own
+  size answers through `json_size()`), the listing reads both dwords or
+  `GetFileSizeEx`, and a pattern that does not fit is refused.
+- **N20 — a mutex that could not be created was used anyway.**
+  `sde_mutex_new` called `InitializeCriticalSection`, which returns nothing, so
+  a failure was undetectable.  It now uses
+  `InitializeCriticalSectionAndSpinCount(&m->cs, 0x400u)` and returns NULL,
+  which `core/src/serve.c` checks.
+- **N21 — growth arithmetic on `buf`, `vec` and JSON arrays could overflow or
+  spin.**  `sde_buf_reserve` doubled `cap` with no ceiling, and `sde_vec_push`
+  and the JSON array/object growth did the same, so a `cap` near `SIZE_MAX`
+  wrapped to 0 and the loop retried forever.  Each now refuses a request that
+  cannot be represented and a doubling that would wrap; the buffer's doubling is
+  capped at the request rather than spinning, and a refused growth leaves the
+  container untouched.
+- **N22 — the JSON writer had no depth limit, while the parser's was 64.**  A
+  document the reader accepted could be written back at a depth the kernel would
+  refuse to read, and a tree a client built could be walked until the stack ran
+  out.  The writer now refuses what the reader would refuse.  Pinning that
+  boundary found its real shape: the reader checks `depth >= 64` per value, so
+  63 nested containers is the deepest document it accepts — the writer draws the
+  line in the same place, `core/include/json.h` exposes `SDE_JSON_MAX_DEPTH`,
+  and `core/tests/test_core.c` asserts both sides (the old test asserted 64
+  was accepted, which the reader never did).
+- **N23 — a shell that stopped reading its stdout was noticed only at EOF.**
+  `serve` ignored a failed `sde_port_stdout_write`, so a dead reader could
+  buffer writes until the pipe filled.  The loop now stops as soon as a write
+  fails.
+- **N24 — base64 encoding under-allocated by four bytes for a partial group.**
+  `sde_base64_encode` sized its result as `groups * 4 + (rem ? rem + 1 : 0)`,
+  which is right for the data characters but wrong for the padding: a final group
+  of one or two bytes still writes all four characters (with `==` or `=`).  Any
+  input whose length was not a multiple of three therefore wrote up to four bytes
+  past the end of a freshly `malloc`'d buffer — silent corruption in a build
+  without a test, and `STATUS_HEAP_CORRUPTION` (`0xC0000374`) the moment
+  `core/tests/test_blob.c` encoded a length like that.  The size is now
+  `groups * 4 + (rem ? 4 : 0)`.  The test that found it is the round trip over
+  all 256 byte values, which is exactly the input a friendlier example would
+  have missed.
 
 ## Shell host (`shell/main.mjs`)
 

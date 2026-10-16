@@ -3,6 +3,114 @@
 What changed, in the order it changed.  This project is a prototype: the
 version number says how usable it is, not how finished.
 
+## Unreleased
+### Kernel
+
+- **A revision of 0 now means one thing: "cannot say".**  `rev_of_file()`
+  returned 0 both for a file that is not there and for a file it could not read,
+  and the 32-bit hash it otherwise produces can be 0 by itself, so a client's
+  `base_revision: 0` could match a file it had never read.  A natural hash of 0
+  is mapped to 1, a file that exists but cannot be read for its revision is
+  reported apart, and
+  `file.write` with a base it cannot compare is refused (`1003 IO`) rather than
+  treated as a match.  This is the fix for the silent lost update the audit
+  described; `docs/BUGS.md` N17, `docs/PROTOCOL.md` under `file.stat` and
+  `file.write`.
+- **`file.write` publishes atomically.**  Both write paths now go through
+  `sde_port_write_file`, which writes a neighbouring `.tmp` and replaces the
+  target, so a crash or a full disk leaves the whole old file or the whole new
+  one.  `sde_port_replace_file` is one `MoveFileExA` with
+  `MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED`: it no longer falls back to
+  `CopyFileA`, and no longer deletes the source when it fails (N15, N16).
+- **Containment asks Windows for the real path.**  A junction or symlink inside
+  the workspace used to pass a lexical check while pointing outside it;
+  `sde_port_path_within` now resolves the root and the deepest existing ancestor
+  with `GetFinalPathNameByHandleW`/`GetLongPathNameW` and refuses anything it
+  cannot place inside the root (N18).  `core/tests/test_port.c` builds a real
+  junction and asserts both directions.
+- **Sizes are 64-bit and a long path is refused, not cut.**  `sde_port_file_size`
+  and `sde_dirent.size` are `int64_t`, the listing reads both dwords (or
+  `GetFileSizeEx`), and `sde_port_list_dir` refuses a pattern that does not fit
+  instead of listing a truncated one (N19).  `proc.list`'s `size` and every
+  kernel size answer still go through the JSON number helper.
+- **Smaller hardening from the same pass:** `sde_mutex_new` checks
+  `InitializeCriticalSectionAndSpinCount` and can fail (N20); `buf`, `vec` and
+  the JSON arrays refuse an unrepresentable request or a doubling that would
+  wrap instead of spinning (N21); the JSON writer refuses a nesting depth the
+  reader would refuse, so what the kernel accepts it can also write (N22); and
+  `serve` stops reading a client whose stdout write failed instead of filling a
+  pipe (N23).
+- **Binary and large files have an interface now: `file.blob*`.**  `file.read`
+  carries a file inside a JSON string, which cannot hold a NUL byte, and it
+  refuses anything past 4 MiB, so a PNG, a compiled artefact or a 200 MiB log had
+  no way in.  Five methods move the bytes through a *session* instead:
+  `file.blobOpen {path, mode, base_revision?, want_revision?}`,
+  `file.blobRead {session, offset?, length?}`,
+  `file.blobAppend {session, data, offset?}`,
+  `file.blobCommit {session, total_size}` and `file.blobAbort {session}`.  Bytes
+  travel in `data` as base64 (four characters per three bytes) and one chunk is
+  at most 1 MiB decoded; the kernel holds eight sessions at once and forgets one
+  that has been idle for fifteen minutes, temporary file included.
+- **A write session stages, and the last chunk publishes.**  `file.blobAppend`
+  writes `<path>.tmp` (the first chunk creates it, and its parent directory
+  exactly as `file.write` does) and `file.blobCommit` replaces the target with
+  it through the same `sde_port_replace_file` `file.write` uses, so the
+  publication is atomic.  `total_size` is required and must equal the bytes
+  written, which makes "the last chunk" a statement rather than a guess; the
+  result reports the revision `file.read` would report for those bytes, and
+  `file.changed` is emitted before the response.  A refused commit does **not**
+  throw the session away: the client can send more and commit again.  A write
+  session left open by a client is cleaned up by `file.blobAbort`, by the next
+  `file.blobOpen` on the same path (that is where a leftover `<path>.tmp` from a
+  kernel that died mid-session is removed), and by the kernel's own shutdown.
+- **`base_revision` is checked before a session exists.**  `file.blobOpen` with
+  a `base_revision` that no longer matches is refused with the same
+  `1001 STALE_REVISION` and `data.current_revision` as `file.write`, and it
+  leaves no session and no temporary file behind.  A read session that asks past
+  the end is answered *at* the end rather than refused, so a client cannot get
+  stuck past EOF.
+- **Two new modules carry it, both optional in the trim manifest.**  `base64` is
+  a strict codec — a length that is not a multiple of four, a character outside
+  the alphabet, padding anywhere but the end, or padding that would carry
+  information is refused — and `blob` is the session table.  The port grew
+  `sde_port_read_at` (offset read into a buffer, re-measuring the size) and
+  `sde_port_append_file`.  A fork that cuts `blob` keeps text files exactly as
+  they were (`docs/TRIM.md`); `docs/PROTOCOL.md` documents all five methods, and
+  `seide modules` now prints twelve modules.
+
+### Tests
+
+- **The kernel has more than one C test now.**  `core/tests/test_json.c` is
+  joined by `core/tests/test_core.c` (buffer and vector growth, the JSON depth
+  boundary on both sides, and a 4000-document fuzz round-trip) and
+  `core/tests/test_port.c` (containment, a real junction escape, `mkdirs`,
+  write-read round-trip, atomic write leaves no `.tmp`, listing sizes, mutex
+  creation).  `make test` builds and runs all four before the kernel's own
+  probes, and `core/include/json.h` exposes `SDE_JSON_MAX_DEPTH` so the two
+  sides of the depth rule cannot drift.  The port layer, which had no C test at
+  all, now has 48 checks of its own.
+- **`core/tests/test_blob.c` proves the sessions end to end (129 checks).**  It
+  links the whole kernel except `main.c`, so the app it drives is the real one.
+  It pins a base64 round trip of all 256 byte values, an over-1-MiB chunk
+  refused, a 1 MiB + 300 + 2 byte file published atomically and hashing to the
+  revision `file.read` reports, a stale `base_revision` refused with the current
+  revision and nothing left on disk, a refused commit keeping the session and
+  its temporary, read sessions (sequential chunks, an explicit offset that moves
+  the cursor, an offset past the end clamped to the end, one-byte reads), one
+  writer per target path, the eight-session table, a 5 MiB file that
+  `file.read` still refuses while the session layer reads and hashes it, and the
+  five handlers through `sde_rpc_handle`: their method names, the codes they
+  refuse with (1001 and 1002, -32602, -32601), the base64 a client sends, and
+  the `file.changed` a commit emits.  Writing
+  it found a real bug: `sde_base64_encode` under-allocated by four bytes for any
+  input that was not a multiple of three, and the test died with
+  `STATUS_HEAP_CORRUPTION` until that was fixed (`docs/BUGS.md`, N24).
+- **The depth test was wrong, and writing it found the right answer.**  The
+  reader refuses a value at `depth >= 64`, so the deepest document it accepts
+  has 63 nested containers — not the 64 the old counterexample assumed.  The
+  writer draws its line in the same place, which is what
+  `core/tests/test_core.c` pins.
+
 ## v0.4.1-alpha.1 — 2026-10-16
 ### Subsystems
 

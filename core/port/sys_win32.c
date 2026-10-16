@@ -387,6 +387,226 @@ static char *lower_dup(const char *s)
     return c;
 }
 
+/* ---- resolved paths ---------------------------------------------------- */
+
+/*
+ * A path can look contained and not be.  `link\x` is inside the workspace by
+ * every lexical measure, yet a junction (or a symlink, or an 8.3 short name
+ * that names a different directory) can put `x` somewhere else entirely.  The
+ * lexical check below still rejects the obvious escapes without touching the
+ * disk; when it says yes, these helpers ask Windows where the path really is.
+ */
+
+static wchar_t *wide_from_utf8(const char *s)
+{
+    int      n;
+    wchar_t *w;
+
+    n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (n <= 0) {
+        return NULL;
+    }
+    w = (wchar_t *) malloc((size_t) n * sizeof(wchar_t));
+    if (w == NULL) {
+        return NULL;
+    }
+    if (MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n) <= 0) {
+        free(w);
+        return NULL;
+    }
+    return w;
+}
+
+/*
+ * The final path Windows resolves `p` to, lowercased with '/' separators, or
+ * NULL when p cannot be opened.  GetFinalPathNameByHandleW resolves every
+ * junction, symlink and short name on the way, which is exactly what a
+ * containment test needs and what comparing two strings cannot do.
+ */
+static char *final_path_lower(const char *p)
+{
+    wchar_t *w;
+    wchar_t *buf;
+    HANDLE   h;
+    DWORD    cap;
+    DWORD    n;
+    int      utf8len;
+    char    *out;
+    size_t   i;
+    size_t   skip;
+
+    w = wide_from_utf8(p);
+    if (w == NULL) {
+        return NULL;
+    }
+    h = CreateFileW(w, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(w);
+    if (h == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+
+    cap = 512u;
+    buf = (wchar_t *) malloc((size_t) cap * sizeof(wchar_t));
+    if (buf == NULL) {
+        CloseHandle(h);
+        return NULL;
+    }
+    for (;;) {
+        n = GetFinalPathNameByHandleW(h, buf, cap, FILE_NAME_NORMALIZED);
+        if (n == 0) {
+            free(buf);
+            CloseHandle(h);
+            return NULL;
+        }
+        if (n < cap) {
+            break;
+        }
+        free(buf);
+        cap = n + 1u;
+        buf = (wchar_t *) malloc((size_t) cap * sizeof(wchar_t));
+        if (buf == NULL) {
+            CloseHandle(h);
+            return NULL;
+        }
+    }
+    CloseHandle(h);
+
+    utf8len = WideCharToMultiByte(CP_UTF8, 0, buf, -1, NULL, 0, NULL, NULL);
+    if (utf8len <= 0) {
+        free(buf);
+        return NULL;
+    }
+    out = (char *) malloc((size_t) utf8len);
+    if (out == NULL) {
+        free(buf);
+        return NULL;
+    }
+    if (WideCharToMultiByte(CP_UTF8, 0, buf, -1, out, utf8len, NULL, NULL)
+        <= 0) {
+        free(buf);
+        free(out);
+        return NULL;
+    }
+    free(buf);
+
+    /* "\\?\C:\x" and "\\?\UNC\server\share" are the same paths, spelled. */
+    skip = 0;
+    if (strncmp(out, "\\\\?\\UNC\\", 8) == 0) {
+        char *rest = sde_port_strdup(out + 7);   /* keep the leading "\\" */
+        if (rest == NULL) {
+            free(out);
+            return NULL;
+        }
+        free(out);
+        out = rest;
+    } else if (strncmp(out, "\\\\?\\", 4) == 0) {
+        skip = 4;
+    }
+
+    for (i = skip; out[i] != '\0'; i++) {
+        char ch = out[i];
+        if (ch == '\\') {
+            out[i] = '/';
+        } else if (ch >= 'A' && ch <= 'Z') {
+            out[i] = (char) (ch - 'A' + 'a');
+        }
+    }
+    if (skip > 0) {
+        memmove(out, out + skip, strlen(out + skip) + 1u);
+    }
+    return out;
+}
+
+/*
+ * The resolved path of `p` when part of it does not exist yet: resolve the
+ * deepest ancestor that does, then append the rest, which cannot contain a
+ * junction because it is not on disk.  NULL when even the root is unresolvable.
+ */
+static char *resolve_existing_prefix(const char *p)
+{
+    char *work;
+    char *suffix;
+    char *real;
+    char *out;
+
+    work = sde_port_strdup(p);
+    if (work == NULL) {
+        return NULL;
+    }
+    suffix = NULL;
+    real = NULL;
+
+    for (;;) {
+        char  *slash;
+        char  *tail;
+        char  *joined;
+        size_t need;
+
+        real = final_path_lower(work);
+        if (real != NULL) {
+            break;
+        }
+        slash = strrchr(work, '/');
+        if (slash == NULL || slash == work) {
+            break;
+        }
+        tail = sde_port_strdup(slash);
+        if (tail == NULL) {
+            break;
+        }
+        *slash = '\0';
+        if (suffix == NULL) {
+            suffix = tail;
+        } else {
+            need = strlen(tail) + strlen(suffix) + 1u;
+            joined = (char *) malloc(need);
+            if (joined == NULL) {
+                free(tail);
+                break;
+            }
+            snprintf(joined, need, "%s%s", tail, suffix);
+            free(tail);
+            free(suffix);
+            suffix = joined;
+        }
+    }
+    free(work);
+
+    if (real == NULL) {
+        free(suffix);
+        return NULL;
+    }
+    if (suffix == NULL) {
+        return real;
+    }
+    out = (char *) malloc(strlen(real) + strlen(suffix) + 1u);
+    if (out != NULL) {
+        sprintf(out, "%s%s", real, suffix);
+    }
+    free(real);
+    free(suffix);
+    return out;
+}
+
+/* Does the resolved path `p` sit at or under the resolved path `root`? */
+static int resolved_within(const char *root, const char *p)
+{
+    size_t rlen;
+
+    rlen = strlen(root);
+    while (rlen > 1 && root[rlen - 1] == '/') {
+        rlen--;
+    }
+    if (strlen(p) < rlen) {
+        return 0;
+    }
+    if (strncmp(root, p, rlen) != 0) {
+        return 0;
+    }
+    return (p[rlen] == '\0' || p[rlen] == '/') ? 1 : 0;
+}
+
 int sde_port_path_within(const char *root, const char *p)
 {
     char *ra;
@@ -423,6 +643,22 @@ int sde_port_path_within(const char *root, const char *p)
                && pl[rlen] == '/') {
         yes = 1;
     }
+
+    /*
+     * A lexical match is necessary, not sufficient.  If either path cannot be
+     * resolved (a workspace that does not exist yet), keep the lexical answer:
+     * refusing everything would break the first `file.write` in a new tree.
+     */
+    if (yes) {
+        char *rreal = final_path_lower(rl);
+        char *preal = resolve_existing_prefix(pl);
+        if (rreal != NULL && preal != NULL) {
+            yes = resolved_within(rreal, preal);
+        }
+        free(rreal);
+        free(preal);
+    }
+
     free(rl);
     free(pl);
     return yes;
@@ -505,7 +741,9 @@ int sde_port_write_file(const char *path, const char *data, size_t len,
 {
     FILE  *f;
     char  *parent;
+    char  *tmp;
     size_t total;
+    size_t tmpcap;
     const char *slash;
 
     /* Make sure the containing directory exists before opening the file. */
@@ -524,15 +762,154 @@ int sde_port_write_file(const char *path, const char *data, size_t len,
         free(parent);
     }
 
-    f = fopen(path, "wb");
+    /*
+     * Write a neighbour and replace it.  Every write in the kernel comes
+     * through here (file.write and the view document alike), so this is the
+     * one place that has to be atomic: a reader -- or a crash, or a full disk
+     * -- then sees either the whole old file or the whole new one, never a
+     * truncated one whose hash no longer matches what the client holds.
+     */
+    tmpcap = strlen(path) + 5u;
+    tmp = (char *) malloc(tmpcap);
+    if (tmp == NULL) {
+        set_err(err, errcap, "out of memory writing", path);
+        return -1;
+    }
+    snprintf(tmp, tmpcap, "%s.tmp", path);
+
+    f = fopen(tmp, "wb");
     if (f == NULL) {
+        free(tmp);
         set_err(err, errcap, "cannot open for writing", path);
         return -1;
     }
     total = (len == 0) ? 0 : fwrite(data, 1, len, f);
     if (total != len) {
         fclose(f);
+        sde_port_remove_file(tmp);
+        free(tmp);
         set_err(err, errcap, "short write on", path);
+        return -1;
+    }
+    if (fclose(f) != 0) {
+        sde_port_remove_file(tmp);
+        free(tmp);
+        set_err(err, errcap, "cannot flush", path);
+        return -1;
+    }
+    if (sde_port_replace_file(tmp, path) != 0) {
+        sde_port_remove_file(tmp);
+        free(tmp);
+        set_err(err, errcap, "cannot replace", path);
+        return -1;
+    }
+    free(tmp);
+    return 0;
+}
+
+/*
+ * A streamed read: the caller decides how much of the file it wants to hold at
+ * once, so a 2 GiB file never has to fit in memory.  The chunk lives on the
+ * stack, which is why it is this size and not a tuned constant.
+ */
+int64_t sde_port_read_at(const char *path, int64_t offset, size_t len,
+                         sde_buf *out, int64_t *out_size,
+                         char *err, size_t errcap)
+{
+    char    chunk[65536];
+    FILE   *f;
+    int64_t total = 0;
+    int64_t size;
+
+    if (out_size != NULL) {
+        *out_size = -1;
+    }
+    if (offset < 0) {
+        set_err(err, errcap, "negative offset reading", path);
+        return -1;
+    }
+    size = sde_port_file_size(path);
+    if (size < 0) {
+        set_err(err, errcap, "cannot read", path);
+        return -1;
+    }
+    if (offset >= size || len == 0u) {
+        if (out_size != NULL) {
+            *out_size = size;
+        }
+        return 0;
+    }
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        set_err(err, errcap, "cannot open for reading", path);
+        return -1;
+    }
+    if (_fseeki64(f, offset, SEEK_SET) != 0) {
+        fclose(f);
+        set_err(err, errcap, "cannot seek in", path);
+        return -1;
+    }
+    for (;;) {
+        size_t want = len - (size_t) total;
+        size_t got;
+
+        if (want == 0u) {
+            break;
+        }
+        if (want > sizeof(chunk)) {
+            want = sizeof(chunk);
+        }
+        got = fread(chunk, 1, want, f);
+        if (got == 0u) {
+            if (ferror(f)) {
+                fclose(f);
+                set_err(err, errcap, "read failed on", path);
+                return -1;
+            }
+            break;  /* end of file */
+        }
+        if (sde_buf_add(out, chunk, got) != 0) {
+            fclose(f);
+            set_err(err, errcap, "out of memory reading", path);
+            return -1;
+        }
+        total += (int64_t) got;
+    }
+    if (fclose(f) != 0) {
+        set_err(err, errcap, "read failed on", path);
+        return -1;
+    }
+    /*
+     * Re-measure: the file may have grown or shrunk while it was being read,
+     * and a caller that reports the size it just saw is more useful than one
+     * that reports the size from before the read.
+     */
+    size = sde_port_file_size(path);
+    if (out_size != NULL) {
+        *out_size = size;
+    }
+    return total;
+}
+
+int sde_port_append_file(const char *path, const char *data, size_t len,
+                         char *err, size_t errcap)
+{
+    FILE   *f;
+    size_t  total;
+
+    if (len > 0u && data == NULL) {
+        set_err(err, errcap, "no data appending to", path);
+        return -1;
+    }
+    f = fopen(path, "ab");
+    if (f == NULL) {
+        set_err(err, errcap, "cannot open for appending", path);
+        return -1;
+    }
+    total = (len == 0u) ? 0u : fwrite(data, 1, len, f);
+    if (total != len) {
+        fclose(f);
+        set_err(err, errcap, "short append on", path);
         return -1;
     }
     if (fclose(f) != 0) {
@@ -548,7 +925,6 @@ int sde_port_file_exists(const char *path)
 
     return (stat(path, &st) == 0) ? 1 : 0;
 }
-
 int sde_port_is_dir(const char *path)
 {
     struct stat st;
@@ -559,14 +935,19 @@ int sde_port_is_dir(const char *path)
     return (st.st_mode & S_IFMT) == S_IFDIR ? 1 : 0;
 }
 
-long sde_port_file_size(const char *path)
+int64_t sde_port_file_size(const char *path)
 {
-    struct stat st;
+    WIN32_FILE_ATTRIBUTE_DATA fa;
 
-    if (stat(path, &st) != 0) {
+    /*
+     * stat()'s st_size is 32 bits here, so a 5 GiB file used to report a
+     * number that fitted in a long and meant nothing.  Two dwords are the
+     * whole answer.
+     */
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) {
         return -1;
     }
-    return (long) st.st_size;
+    return ((int64_t) fa.nFileSizeHigh << 32) | (int64_t) fa.nFileSizeLow;
 }
 
 long sde_port_file_mtime(const char *path)
@@ -587,19 +968,17 @@ int sde_port_remove_file(const char *path)
 int sde_port_replace_file(const char *from, const char *to)
 {
     /*
-     * MoveFileEx with REPLACE_EXISTING is atomic enough for our purpose: a
-     * reader either sees the whole old file or the whole new one, never a
-     * half-written document.
+     * MOVEFILE_REPLACE_EXISTING is what makes this atomic for a reader on the
+     * same volume.  MOVEFILE_COPY_ALLOWED lets Windows do a cross-volume copy
+     * itself; doing that copy by hand, as an earlier version did, meant a
+     * failed copy destroyed the caller's only complete file, because the
+     * source was deleted whether or not the copy had worked.
      */
-    if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING) != 0) {
+    if (MoveFileExA(from, to,
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) != 0) {
         return 0;
     }
-    /* Some volumes refuse a move across directories; fall back to a copy. */
-    if (CopyFileA(from, to, FALSE) != 0) {
-        DeleteFileA(from);
-        return 0;
-    }
-    DeleteFileA(from);
+    /* `from` is left in place: the caller owns it and decides what to do. */
     return -1;
 }
 
@@ -644,12 +1023,18 @@ int sde_port_list_dir(const char *path, sde_vec *out, char *err, size_t errcap)
     char             pattern[1024];
     WIN32_FIND_DATAA fd;
     HANDLE           h;
+    int              n;
 
-    if (snprintf(pattern, sizeof(pattern), "%s\\*", path) < 0) {
+    n = snprintf(pattern, sizeof(pattern), "%s\\*", path);
+    if (n < 0 || (size_t) n >= sizeof(pattern)) {
+        /*
+         * snprintf returns what it *would* have written: a path that does not
+         * fit used to be silently cut, and the listing then described a
+         * directory that is not the one the error message names.
+         */
         set_err(err, errcap, "path too long", path);
         return -1;
     }
-    pattern[sizeof(pattern) - 1] = '\0';
 
     h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) {
@@ -673,7 +1058,8 @@ int sde_port_list_dir(const char *path, sde_vec *out, char *err, size_t errcap)
             }
             strcpy(e->name, fd.cFileName);
             e->is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
-            e->size = (long) fd.nFileSizeLow;
+            e->size = ((int64_t) fd.nFileSizeHigh << 32)
+                      | (int64_t) fd.nFileSizeLow;
             if (sde_vec_push(out, e) != 0) {
                 sde_port_dirent_free(e);
                 FindClose(h);
@@ -704,7 +1090,15 @@ sde_mutex *sde_mutex_new(void)
     if (m == NULL) {
         return NULL;
     }
-    InitializeCriticalSection(&m->cs);
+    /*
+     * InitializeCriticalSection() cannot fail loudly, and its failure mode is
+     * "every later lock is undefined".  The ...AndSpinCount variant returns a
+     * BOOL, so a lock that could not be created is reported instead of used.
+     */
+    if (!InitializeCriticalSectionAndSpinCount(&m->cs, 0x400u)) {
+        free(m);
+        return NULL;
+    }
     return m;
 }
 

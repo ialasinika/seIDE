@@ -40,6 +40,23 @@ typedef struct sde_app sde_app;
 unsigned long sde_rev_of(const char *data, size_t len);
 
 /*
+ * The same hash, fed a piece at a time, so a file can be streamed instead of
+ * held whole in memory.  Start from SDE_REV_SEED, call this once per chunk, and
+ * finish with sde_rev_final(); that is exactly what sde_rev_of() does:
+ *
+ *     sde_rev_final(sde_rev_update(SDE_REV_SEED, data, len))
+ *
+ * The two halves are exposed because the blob interface hashes a file as it
+ * copies it, bytes that may never all be in one buffer at once.
+ */
+#define SDE_REV_SEED 2166136261UL
+
+unsigned long sde_rev_update(unsigned long h, const char *data, size_t len);
+
+/* Maps the one value that means "nothing to compare" onto a usable one. */
+unsigned long sde_rev_final(unsigned long h);
+
+/*
  * Resolves a workspace-relative path.  Rejects absolute paths, `..` escapes
  * and anything that normalises outside `root`.  `*out_abs` is malloc'd.
  */

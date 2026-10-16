@@ -26,7 +26,9 @@ SRC = \
 	core/src/buf.c \
 	core/src/vec.c \
 	core/src/json.c \
+	core/src/base64.c \
 	core/src/wksp.c \
+	core/src/blob.c \
 	core/src/view.c \
 	core/src/proc.c \
 	core/src/rpc.c \
@@ -45,7 +47,7 @@ OBJ = $(addprefix $(OBJDIR)/,$(notdir $(SRC:.c=.o)))
 # Without this line a header-only change -- a version bump is exactly that --
 # rebuilt nothing, and the binary ended up reporting two versions at once:
 # `seide version` from the .c that happened to be edited, `hello` from a stale
-# rpc.o.  Coarse on purpose: eleven sources cost nothing to recompile, and a
+# rpc.o.  Coarse on purpose: a dozen sources cost nothing to recompile, and a
 # wildcard rule has no first-build gap the way `-include *.d` has.
 HEADERS = $(wildcard core/include/*.h)
 
@@ -71,6 +73,29 @@ JSONTEST = build/obj/test_json.exe
 
 $(JSONTEST): core/tests/test_json.c $(OBJDIR)/json.o $(OBJDIR)/buf.o $(OBJDIR)/vec.o
 	$(CC) $(CFLAGS) core/tests/test_json.c $(OBJDIR)/json.o $(OBJDIR)/buf.o $(OBJDIR)/vec.o -o $@
+
+# The containers and the codec's depth promise, with a fuzz loop at the end.
+CORETEST = build/obj/test_core.exe
+
+$(CORETEST): core/tests/test_core.c $(OBJDIR)/json.o $(OBJDIR)/buf.o $(OBJDIR)/vec.o
+	$(CC) $(CFLAGS) core/tests/test_core.c $(OBJDIR)/json.o $(OBJDIR)/buf.o $(OBJDIR)/vec.o -o $@
+
+# The port layer on its own: paths and containment, atomic writes, sizes.
+# This is the only test that touches the filesystem, and only under build/.
+PORTTEST = build/obj/test_port.exe
+
+$(PORTTEST): core/tests/test_port.c $(OBJDIR)/sys_win32.o $(OBJDIR)/buf.o $(OBJDIR)/vec.o
+	$(CC) $(CFLAGS) core/tests/test_port.c $(OBJDIR)/sys_win32.o $(OBJDIR)/buf.o $(OBJDIR)/vec.o -o $@
+
+# The binary / large-file sessions: base64, chunked I/O past the text limits,
+# and the atomic publish.  It needs a whole app, so it links everything but
+# main.c -- blob.c is the module that talks to the workspace and the port layer
+# at once.
+BLOBTEST = build/obj/test_blob.exe
+BLOBDEPS = $(filter-out $(OBJDIR)/main.o,$(OBJ))
+
+$(BLOBTEST): core/tests/test_blob.c $(BLOBDEPS)
+	$(CC) $(CFLAGS) core/tests/test_blob.c $(BLOBDEPS) -o $@
 
 # The object directory is a directory, not a file: an order-only prerequisite
 # keeps make from rebuilding everything whenever its timestamp moves.  It is
@@ -141,11 +166,15 @@ release-dry:
 release:
 	$(PYTHON) tools/release.py
 
-# Everything the project can prove about itself without a window: the C JSON
-# codec, the language layer, the subsystem host, the browser modules, the fixed
-# bugs, the second client, the version copies, and both protocol modes.
-test: check fullcheck probe cli-check version-check $(JSONTEST)
+# Everything the project can prove about itself without a window: the C codec,
+# the containers and the port layer, the blob sessions, the language layer, the
+# subsystem host, the browser modules, the fixed bugs, the second client, the
+# version copies, and both protocol modes.
+test: check fullcheck probe cli-check version-check $(JSONTEST) $(CORETEST) $(PORTTEST) $(BLOBTEST)
 	$(JSONTEST)
+	$(CORETEST)
+	$(PORTTEST)
+	$(BLOBTEST)
 	$(NODE) langs/selftest.mjs
 	$(NODE) subsystems/selftest.mjs
 	$(NODE) shell/web/selftest.mjs

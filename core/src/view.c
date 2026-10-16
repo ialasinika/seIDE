@@ -3,7 +3,7 @@
  * kernel.
  *
  * The work here is small on purpose.  Loading is "resolve, read, skip a BOM,
- * parse"; storing is "print, write a temp file, replace".  Everything that
+ * parse"; storing is "print, hand it to the port".  Everything that
  * used to live in this file's predecessor -- the board schema, id allocation,
  * geometry and link validation, the `.seide/board.json` path -- moved to the
  * client that actually decides what the document means
@@ -49,34 +49,6 @@ static int install(sde_view *v, const char *rel, sde_json *doc)
     v->doc = doc;
     v->path = copy;
     return 0;
-}
-
-/*
- * Creates every missing directory above `abs`.  `sde_wksp_resolve()` hands back
- * an absolute, '/'-separated path, so the last '/' separates the parent that
- * may need creating from the file name itself.
- */
-static int make_parents(const char *abs, char *err, size_t errcap)
-{
-    const char *slash = strrchr(abs, '/');
-    char       *dir;
-    size_t      n;
-    int         rc;
-
-    if (slash == NULL || slash == abs) {
-        return 0;
-    }
-    n = (size_t) (slash - abs);
-    dir = (char *) malloc(n + 1u);
-    if (dir == NULL) {
-        set_err(err, errcap, "out of memory");
-        return -1;
-    }
-    memcpy(dir, abs, n);
-    dir[n] = '\0';
-    rc = sde_port_is_dir(dir) ? 0 : sde_port_mkdirs(dir, err, errcap);
-    free(dir);
-    return rc;
 }
 
 sde_view *sde_view_new(void)
@@ -158,7 +130,7 @@ int sde_view_load(sde_view *v, const sde_app *app, const char *rel,
         }
         return 0;
     }
-    if (sde_port_file_size(abs) > (long) SDE_VIEW_MAX_READ) {
+    if (sde_port_file_size(abs) > (int64_t) SDE_VIEW_MAX_READ) {
         set_err(err, errcap, "the view document is larger than the kernel will read");
         free(abs);
         return -1;
@@ -205,9 +177,7 @@ int sde_view_store(sde_view *v, const sde_app *app, const char *rel,
                    sde_json *doc, char *err, size_t errcap)
 {
     char   *abs = NULL;
-    char   *tmp = NULL;
     char   *path_copy;
-    size_t  tmpcap;
     sde_buf out;
     int     rc = -1;
 
@@ -230,34 +200,20 @@ int sde_view_store(sde_view *v, const sde_app *app, const char *rel,
         goto done;
     }
     /*
-     * Write a neighbour first and replace it: a reader (or a crash) then sees
-     * either the whole old document or the whole new one, never half of one.
+     * The port publishes atomically -- it writes a neighbour and replaces this
+     * path -- so a reader (or a crash) sees either the whole old document or
+     * the whole new one, never half of one.  file.write gets the same guarantee
+     * from the same function; there is no second write path left to get it
+     * wrong in.
      */
-    tmpcap = strlen(abs) + 5u;
-    tmp = (char *) malloc(tmpcap);
-    if (tmp == NULL) {
-        set_err(err, errcap, "out of memory");
-        goto done;
-    }
-    snprintf(tmp, tmpcap, "%s.tmp", abs);
-    if (make_parents(abs, err, errcap) != 0) {
-        goto done;
-    }
-    if (sde_port_write_file(tmp, sde_buf_cstr(&out), out.len, err, errcap) != 0) {
-        sde_port_remove_file(tmp);
+    if (sde_port_write_file(abs, sde_buf_cstr(&out), out.len, err, errcap) != 0) {
         set_err(err, errcap, "cannot write the view document");
-        goto done;
-    }
-    if (sde_port_replace_file(tmp, abs) != 0) {
-        sde_port_remove_file(tmp);
-        set_err(err, errcap, "cannot replace the view document");
         goto done;
     }
     rc = 0;
 
 done:
     sde_buf_free(&out);
-    free(tmp);
     free(abs);
     if (rc != 0) {
         free(path_copy);

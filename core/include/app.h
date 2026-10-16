@@ -40,6 +40,11 @@ typedef struct sde_view sde_view;
 typedef struct sde_procset sde_procset;
 #endif
 
+#ifndef SEIDE_BLOBSET_TYPEDEF
+#define SEIDE_BLOBSET_TYPEDEF
+typedef struct sde_blobset sde_blobset;
+#endif
+
 /* Takes ownership of `payload`.  Returns 0 on success. */
 typedef int (*sde_emit_fn)(void *ud, sde_json *payload);
 
@@ -47,6 +52,7 @@ struct sde_app {
     char        *root;      /* absolute, '/'-separated workspace root */
     sde_view    *view;      /* the client's view document: opaque JSON */
     sde_procset *procs;     /* running child processes */
+    sde_blobset *blobs;     /* open binary / large-file sessions */
     sde_emit_fn  emit;
     void        *emit_ud;
     int          verbose;

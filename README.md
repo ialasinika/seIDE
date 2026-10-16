@@ -220,7 +220,7 @@ C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile fullcheck   # whole endpoint
 C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile probe       # every bug in docs/BUGS.md: all ok
 C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile smoke       # the window, headless: 5 + 37 checks, 0 failed
 C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile version-check  # every copy agrees, and the changelog has a home for it
-C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile test        # check, fullcheck, probe, cli-check, version-check, the JSON test, both JS self-tests
+C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile test        # check, fullcheck, probe, cli-check, version-check, the three C tests, all three JS self-tests
 ```
 
 The individual pieces, if you want to run them directly:
@@ -234,12 +234,14 @@ python tools/browser_smoke.py                  # renders the real window; SKIP (
 python tools/input_smoke.py                    # keys, wheel, the editor (incl. completions, the issue strip and the line numbers), multi-select, a search, a frame, a watched file and the classic view: 39 passed, 0 failed
 python tools/version.py check                  # every copy of the version, and the changelog section
 build/obj/test_json.exe                        # the C JSON codec: "all good"
+build/obj/test_core.exe                        # buf, vec and the JSON depth boundary: "all good"
+build/obj/test_port.exe                        # the OS seam, incl. a real junction escape: "all good"
 node langs/selftest.mjs                        # 92/92 checks passed
 node shell/web/selftest.mjs                    # ok 130/130 (pure JS: no DOM)
 ```
 
 `make test` runs `check`, then `fullcheck`, then `probe`, then `cli-check`, then
-`version-check`, then the JSON test and the three JavaScript self-tests
+`version-check`, then the three C tests and the three JavaScript self-tests
 (`langs/`, `subsystems/`, `shell/web/`) **in that order**, so a `fullcheck`
 failure would stop the run before the self-tests are
 reached. `cli-check` is the second consumer of the protocol: `tools/seide_cli.py`
@@ -381,12 +383,14 @@ CHANGELOG.md            what is in this version, and what is not
 .gitattributes          the checkout is the repository's bytes: LF everywhere
 
 core/                   the kernel -- C89, no dependencies
-  include/              public headers: buf, vec, json, port, wksp, view, proc,
-                        serve, rpc, app, module, seide_cfg
-  src/                  one file per module: buf, vec, json, wksp, view, proc,
-                        rpc, serve, app, main
+  include/              public headers: buf, vec, json, base64, port, wksp, blob,
+                        view, proc, serve, rpc, app, module, seide_cfg
+  src/                  one file per module: buf, vec, json, base64, wksp, blob,
+                        view, proc, rpc, serve, app, main
   port/                 the only OS-aware code: sys_win32.c, proc_win32.c
-  tests/                test_json.c (JSON round-trip harness for the kernel)
+  tests/                test_json.c, test_core.c, test_port.c, test_blob.c -- the
+                        C harnesses for the kernel, its containers, the OS seam
+                        and the binary/large-file sessions
 
 langs/                  language support, deliberately OUTSIDE the kernel
   brainfuck.lang        the flat family: a line comment, a string, a token list
