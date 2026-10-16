@@ -252,6 +252,7 @@ dialog anywhere:
 | `Ctrl+I` | print the hover for the word at the caret: its first line, and where it came from |
 | `Ctrl+.` / `Ctrl+Shift+.` | next / previous issue, selecting it |
 | `Esc` | close the completion list, or the find bar |
+| click the gutter | hide the line numbers; a second click brings them back |
 
 Every hit is painted in the colour layer as well as selected in the textarea, so
 matches stay visible while the caret is in the find bar. The indent, auto-indent
@@ -261,6 +262,17 @@ away: after a `Tab`, `Ctrl+Z` still takes that `Tab` back. The pure parts
 (`indentSelection`, `indentAfterEnter`, `findMatches`, `replaceMatchAt`,
 `replaceAllMatches`, `markHits`) are exported for `selftest.mjs`; the wiring is
 pressed for real by `tools/input_smoke.py`.
+
+#### Line numbers are on, and they are not in the way
+
+The numbers sit in a gutter of their own and start visible: the first question a
+diagnostic raises is which line it is on, and answering it should not cost a
+click. A click on the gutter takes them away for the sessions where the columns
+matter more. They are one text node in a `<pre>` carrying the code's own font,
+line height and top padding, so line *N* lands on line *N* with no per-row
+layout; only the textarea's vertical scroll is mirrored onto it, as a transform,
+so a scroll costs no reflow. Hiding the gutter hands its columns back to the
+code, because the colour layer and the textarea are inset behind the same width.
 
 #### Completions and issues are docked rows, not a popup at the caret
 

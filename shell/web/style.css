@@ -488,6 +488,7 @@ body.is-classic #board:active { cursor: default; }
   flex: 1;
   min-height: 0;
   overflow: hidden;
+  --ed-gutter-w: 52px;
 }
 
 .ed-scroll {
@@ -539,6 +540,44 @@ body.is-classic #board:active { cursor: default; }
 
 .ed-input::selection { background: #6fb3ff44; }
 .ed-input:focus { box-shadow: inset 0 0 0 1px var(--accent-dim); }
+
+/* The line-number gutter, on by default.  The numbers are one <pre> carrying
+   the code's own font, line height and top padding, right-aligned against the
+   rule, so line N sits on line N without a row per line; the gutter itself only
+   mirrors the textarea's vertical scroll (a transform, never a reflow).  A
+   click hides it and hands its columns back to the code. */
+.ed-gutter {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: var(--ed-gutter-w);
+  overflow: hidden;
+  background: #14171c;
+  border-right: 1px solid #23272e;
+  cursor: pointer;
+}
+
+.ed-gutter-numbers {
+  margin: 0;
+  padding: var(--code-pad) 8px var(--code-pad) 0;
+  font-family: var(--code-font);
+  font-size: var(--code-size);
+  line-height: var(--code-line);
+  text-align: right;
+  white-space: pre;
+  color: #59636f;
+  user-select: none;
+  will-change: transform;
+}
+
+.ed-surface.has-gutter .ed-scroll,
+.ed-surface.has-gutter .ed-input {
+  left: var(--ed-gutter-w);
+  width: calc(100% - var(--ed-gutter-w));
+}
+
+.ed-surface.no-gutter .ed-gutter { display: none; }
 
 /* Find and replace inside the card: a bar, not a browser dialog, because a
    dialog would swallow the caret and the board would lose its focus. */

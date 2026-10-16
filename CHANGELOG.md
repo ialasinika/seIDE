@@ -23,6 +23,21 @@ version number says how usable it is, not how finished.
   shows they fail without the guard.  The `v0.4.0-alpha.1` artifacts and tag are
   unchanged; this is the next line.
 
+### Client
+
+- **The editor shows line numbers, and starts that way.**  A gutter of its own
+  in `shell/web/cards.mjs`, one number per line of the buffer, right-aligned
+  against a rule.  The first question a diagnostic raises is which line it is on,
+  so the answer is there before the click; a click on the gutter hides the
+  numbers for the sessions where the columns matter more, and a second brings
+  them back (the colour layer and the textarea are inset behind the same width,
+  so the columns really are handed back).  The numbers are one text node in a
+  `<pre>` carrying the code's own font, line height and top padding, so line *N*
+  sits on line *N* with no per-row layout, and the textarea's vertical scroll is
+  mirrored onto it as a transform, never a reflow.  `tools/input_smoke.py` reads
+  the gutter out of the real DOM — one number per line, on, hidden by a click and
+  back by the next (39 checks).
+
 ## v0.4.0-alpha.1 — 2026-10-16
 ### Kernel
 

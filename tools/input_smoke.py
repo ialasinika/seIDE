@@ -35,8 +35,10 @@ reach into the iframe and do what a person does:
    after an opener, Ctrl+F and the find bar, replace-all and Escape -- and read
    the buffer and the painted hits back out of the DOM; then ask it for
    completions with Ctrl+Space (Enter takes the highlighted one, Escape closes
-   the list) and put a TODO and an unclosed parenthesis in the buffer to read
-   the issue strip and click a row to check the caret lands on the text it names;
+   the list), put a TODO and an unclosed parenthesis in the buffer to read the
+   issue strip and click a row to check the caret lands on the text it names,
+   and read the line-number gutter: one number per line, on by default, hidden
+   by a click on it and back by a second one;
 8. select more than one card -- Ctrl+A, ctrl+click, a shift+drag band, a group
    drag and a group Delete with one Ctrl+Z -- and read the counts and the
    positions back out;
@@ -438,6 +440,26 @@ async function main() {
           + " value=" + JSON.stringify(area.value));
       }
       editorOk = editorOk && issueOk && jumped;
+
+      /* The line-number gutter: on by default, one number per line of the
+         buffer, and a click on it hides it without losing the numbers. */
+      const gutter = doc.querySelector('[data-card-id="c1"] [data-role="gutter"]');
+      const gutterRows = gutter === null ? [] : String(gutter.textContent || "").split("\\n");
+      const gutterLines = area.value.split("\\n").length;
+      const gutterOn = gutter !== null && gutter.dataset.on === "on" && gutter.offsetWidth > 0;
+      say("editor-gutter: " + (gutter !== null) + " on=" + (gutter === null ? "" : String(gutter.dataset.on))
+        + " rows=" + gutterRows.length + " lines=" + gutterLines
+        + " first=" + JSON.stringify(gutterRows.length > 0 ? gutterRows[0] : "")
+        + " last=" + JSON.stringify(gutterRows.length > 0 ? gutterRows[gutterRows.length - 1] : ""));
+      let gutterToggled = false;
+      if (gutter !== null) {
+        gutter.dispatchEvent(new win.MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+        gutterToggled = gutter.dataset.on === "off" && gutter.offsetWidth === 0;
+        gutter.dispatchEvent(new win.MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      }
+      say("editor-gutter-toggle: " + gutterToggled
+        + " back=" + (gutter === null ? "" : String(gutter.dataset.on)));
+      editorOk = editorOk && gutterOn && gutterToggled && gutterRows.length === gutterLines;
     }
   } catch (error) {
     editorOk = false;
@@ -1074,6 +1096,8 @@ def parse_editor(body: str) -> dict:
         ("undo", r"editor-undo: typed=(\w+) command=(\w+) restored=(\w+)"),
         ("complete", r'editor-complete: (true|false) shown=(\d+) labels="([^"]*)" source="([^"]*)"'),
         ("issues", r'editor-issues: (true|false) rows=(\d+) severities="([^"]*)" first="([^"]*)"'),
+        ("gutter", r'editor-gutter: (true|false) on=(\w+) rows=(\d+) lines=(\d+) first="([^"]*)" last="([^"]*)"'),
+        ("gutter_toggle", r"editor-gutter-toggle: (true|false) back=(\w+)"),
     )
     for key, pattern in patterns:
         match = re.search(pattern, body)
@@ -1215,7 +1239,7 @@ def main(argv=None) -> int:
         edge = bs.find_edge(args.edge)
     except bs.DriverError as exc:
         print(f"[SKIP] no browser available: {exc}")
-        print("summary: 0 passed, 0 failed, 37 skipped (no browser)")
+        print("summary: 0 passed, 0 failed, 39 skipped (no browser)")
         return 0
 
     backup = bs.BoardBackup(bs.BOARD_PATH)
@@ -1353,6 +1377,15 @@ def main(argv=None) -> int:
     results.check("a stray brace becomes an issue row and clicking it moves the caret there",
                   issues is not None and issues[0] == "true",
                   " ".join(issues[1:]) if issues else "no editor-issues line")
+    gutter = editor.get("gutter")
+    results.check("line numbers are on by default, one per line of the buffer",
+                  gutter is not None and gutter[0] == "true" and gutter[1] == "on"
+                  and gutter[2] == gutter[3] and gutter[4] == "1",
+                  " ".join(gutter[1:]) if gutter else "no editor-gutter line")
+    toggled = editor.get("gutter_toggle")
+    results.check("a click on the gutter hides the numbers and a second click brings them back",
+                  toggled is not None and toggled[0] == "true" and toggled[1] == "on",
+                  " ".join(toggled[1:]) if toggled else "no editor-gutter-toggle line")
 
     select = parse_select(body)
 

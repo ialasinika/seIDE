@@ -231,7 +231,7 @@ python tools/e2e.py --seide build/seide.exe --keep-going
 python tools/kernel_probe.py                   # the fixed bugs: summary: all ok
 python tools/seide_cli.py selfcheck            # the second client, against a scratch workspace: summary: all ok
 python tools/browser_smoke.py                  # renders the real window; SKIP (exit 0) with no browser
-python tools/input_smoke.py                    # keys, wheel, the editor (incl. completions and the issue strip), multi-select, a search, a frame, a watched file and the classic view: 37 passed, 0 failed
+python tools/input_smoke.py                    # keys, wheel, the editor (incl. completions, the issue strip and the line numbers), multi-select, a search, a frame, a watched file and the classic view: 39 passed, 0 failed
 python tools/version.py check                  # every copy of the version, and the changelog section
 build/obj/test_json.exe                        # the C JSON codec: "all good"
 node langs/selftest.mjs                        # 92/92 checks passed
@@ -268,14 +268,16 @@ the file under a card is reported with the text still in the card. It then asks
 the `lsp` subsystem for completions with Ctrl+Space — checks the list came from
 `lsp` and not from the fallback — and takes one with Enter, waits for a `TODO`
 and an unclosed `(` to arrive as issue rows, clicks one and checks the caret went
-there. Last it types
+there, and reads the line-number gutter the editor shows by default — one number
+per line of the buffer, hidden by a click on the gutter and back by a second
+one. Last it types
 `mode classic` and measures the view in the board's own pixels — the tab strip
 under the HUD, the code area filling the right column and the sidebar the left,
 both ending on the board's bottom edge while every other card is hidden — clicks
 a tab and checks the code area moved to that file, wheels the code area and the
 strip to check the viewport did not move, and runs `mode board` to check every
 card, every size and the pan and zoom came back exactly
-(`input_smoke.py`, 37 checks). The wrapper also installs its own `error` and
+(`input_smoke.py`, 39 checks). The wrapper also installs its own `error` and
 `unhandledrejection` listeners on the app's window and fails the run on any
 exception, because a listener that throws changes no DOM node: without that
 count a dead feature and an idle one look exactly alike. On a clone that has no
