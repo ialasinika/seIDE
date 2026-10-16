@@ -3,8 +3,7 @@
 What changed, in the order it changed.  This project is a prototype: the
 version number says how usable it is, not how finished.
 
-## Unreleased
-
+## v0.4.0-alpha.1 — 2026-10-16
 ### Kernel
 
 - **The kernel's child processes gained the other half of the channel.**
