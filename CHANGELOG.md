@@ -3,7 +3,7 @@
 What changed, in the order it changed.  This project is a prototype: the
 version number says how usable it is, not how finished.
 
-## Unreleased
+## v0.4.2-alpha.1 — 2026-10-16
 ### Kernel
 
 - **A revision of 0 now means one thing: "cannot say".**  `rev_of_file()`
