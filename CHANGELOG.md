@@ -3,7 +3,7 @@
 What changed, in the order it changed.  This project is a prototype: the
 version number says how usable it is, not how finished.
 
-## Unreleased
+## v0.4.1-alpha.1 — 2026-10-16
 ### Subsystems
 
 - **A stopped subsystem can be started again.**  A request after
