@@ -24,7 +24,7 @@ int sde_serve(sde_app *app);
 /*
  * The emit sink wired into sde_app_init in `rpc` mode: serialises `payload`
  * as one line and writes it to stdout, taking ownership.  Safe to call from
- * any thread, which is how `exec` publishes output while the main loop is
+ * any thread, which is how `proc` publishes output while the main loop is
  * blocked on input.
  */
 int sde_serve_emit(void *ud, sde_json *payload);

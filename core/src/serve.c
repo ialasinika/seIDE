@@ -5,8 +5,8 @@
  * with the port's raw writer (so no layer can rewrite our line endings).
  *
  * The output mutex is the one piece of synchronisation in the transport: the
- * main thread answers requests while the exec pump thread may publish
- * `exec.output` at any moment, and a half-written frame would desynchronise
+ * main thread answers requests while the proc pump thread may publish
+ * `proc.output` at any moment, and a half-written frame would desynchronise
  * the shell's parser permanently.
  */
 #include "seide_cfg.h"

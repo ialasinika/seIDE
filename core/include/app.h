@@ -35,9 +35,9 @@ typedef struct sde_app sde_app;
 typedef struct sde_view sde_view;
 #endif
 
-#ifndef SEIDE_EXECSET_TYPEDEF
-#define SEIDE_EXECSET_TYPEDEF
-typedef struct sde_execset sde_execset;
+#ifndef SEIDE_PROCSET_TYPEDEF
+#define SEIDE_PROCSET_TYPEDEF
+typedef struct sde_procset sde_procset;
 #endif
 
 /* Takes ownership of `payload`.  Returns 0 on success. */
@@ -46,7 +46,7 @@ typedef int (*sde_emit_fn)(void *ud, sde_json *payload);
 struct sde_app {
     char        *root;      /* absolute, '/'-separated workspace root */
     sde_view    *view;      /* the client's view document: opaque JSON */
-    sde_execset *execs;     /* running child processes */
+    sde_procset *procs;     /* running child processes */
     sde_emit_fn  emit;
     void        *emit_ud;
     int          verbose;

@@ -10,6 +10,7 @@
  */
 
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { spawn as spawnProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,10 +24,12 @@ import {
   parseDescriptor,
 } from "./host.mjs";
 import { complete, diagnose, prefixAt } from "./words.mjs";
+import { fileUri, offsetAt, pathFromUri, positionAt } from "./lsp.mjs";
 import { LangRegistry, loadLanguages } from "../langs/lang.mjs";
 import { tokenize } from "../langs/tokenize.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = dirname(HERE);
 
 let failures = 0;
 let checks = 0;
@@ -388,6 +391,149 @@ section("the host and the real words subsystem");
   check("an unknown words method is METHOD_NOT_FOUND", bad instanceof Error, `${bad}`);
   await host.stopAll();
   check("stopAll() leaves words stopped", host.state("words") === "stopped", host.state("words"));
+}
+
+section("the lsp adapter's framing helpers");
+
+check("a position is a line and a character", (() => {
+  const at = positionAt("ab\ncd\n", 3);
+  return at.line === 1 && at.character === 0;
+})(), JSON.stringify(positionAt("ab\ncd\n", 3)));
+check("an offset survives the trip out and back", (() => {
+  const text = "one\ntwo\n\nfour\n";
+  for (let offset = 0; offset <= text.length; offset += 1) {
+    if (offsetAt(text, positionAt(text, offset)) !== offset) return false;
+  }
+  return true;
+})());
+check("a workspace path becomes a file:// URI", fileUri(ROOT, "examples/hello.bf").startsWith("file:///")
+  && !fileUri(ROOT, "examples/hello.bf").includes("\\")
+  && fileUri(ROOT, "examples/hello.bf").endsWith("/examples/hello.bf"), fileUri(ROOT, "examples/hello.bf"));
+check("a file:// URI becomes a workspace path again", pathFromUri(fileUri(ROOT, "examples/hello.bf"), ROOT) === "examples/hello.bf",
+  pathFromUri(fileUri(ROOT, "examples/hello.bf"), ROOT));
+
+section("the lsp adapter against the scripted stub");
+
+/**
+ * The channel the shell hands a process subsystem: a child whose stdout is a
+ * protocol stream.  Early output is buffered, because the adapter registers
+ * `onOutput` after `spawn` returns and a fast server may speak first.
+ */
+function processChannel(spec) {
+  const child = spawnProcess(spec.command, {
+    cwd: spec.cwd,
+    shell: true,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const listeners = [];
+  const early = [];
+  let exited = null;
+  let onExit = null;
+  const deliver = (data, stream) => {
+    if (listeners.length === 0) {
+      early.push([data, stream]);
+      return;
+    }
+    for (const listener of listeners) listener(data, stream);
+  };
+  child.stdout.on("data", (chunk) => deliver(chunk.toString("utf8"), "stdout"));
+  child.stderr.on("data", (chunk) => deliver(chunk.toString("utf8"), "stderr"));
+  child.on("exit", (code) => {
+    exited = code ?? null;
+    if (onExit !== null) onExit(exited);
+  });
+  return {
+    write(text) {
+      child.stdin.write(text);
+    },
+    onOutput(listener) {
+      listeners.push(listener);
+      while (early.length > 0) listener(...early.shift());
+    },
+    onExit(listener) {
+      onExit = listener;
+      if (exited !== null) listener(exited);
+    },
+    kill() {
+      try {
+        child.kill();
+      } catch {
+        /* already gone */
+      }
+    },
+  };
+}
+
+{
+  const events = [];
+  const host = new SubsystemHost({
+    descriptors: loadSubsystems(HERE),
+    spawn: processChannel,
+    root: ROOT,
+    onEvent: (event) => events.push(event),
+    requestTimeoutMs: 8000,
+  });
+  const started = await host.start("lsp");
+  check("the lsp subsystem starts a real server", started.state === "running", JSON.stringify(started));
+
+  const status = await host.request("lsp", "status", {});
+  check("status reports no open files before one is named", Array.isArray(status.open) && status.open.length === 0,
+    JSON.stringify(status));
+  check("status names the server the descriptor launched", /lsp-stub\.mjs/.test(status.server.command ?? "") && status.server.running === true,
+    JSON.stringify(status.server));
+
+  const completing = await host.request("lsp", "complete", {
+    path: "examples/hello.bf",
+    text: "alpha = 1;\n",
+    offset: 6,
+  });
+  check("completion comes back through the adapter",
+    Array.isArray(completing.items) && completing.items.some((item) => item.label === "alpha"),
+    JSON.stringify(completing));
+
+  const diagnosed = await host.request("lsp", "diagnose", {
+    path: "examples/hello.bf",
+    text: "TODO\n(x\n",
+  });
+  check("the stub's diagnostics arrive as this adapter's shape",
+    diagnosed.stale === false
+    && diagnosed.diagnostics.some((item) => item.code === "todo" && item.severity === "warning")
+    && diagnosed.diagnostics.some((item) => item.code === "unbalanced" && item.severity === "error"),
+    JSON.stringify(diagnosed.diagnostics));
+
+  const hovered = await host.request("lsp", "hover", {
+    path: "examples/hello.bf",
+    text: "alpha = 1;\n",
+    offset: 1,
+  });
+  check("hover describes the word under the caret",
+    typeof hovered.contents === "string" && hovered.contents.includes("alpha"),
+    JSON.stringify(hovered));
+
+  const located = await host.request("lsp", "definition", {
+    path: "examples/hello.bf",
+    text: "alpha = 1;\nalpha\n",
+    offset: 12,
+  });
+  check("definition points back into the workspace",
+    Array.isArray(located.locations) && located.locations.length > 0
+    && located.locations[0].path === "examples/hello.bf",
+    JSON.stringify(located));
+
+  const formatted = await host.request("lsp", "format", {
+    path: "examples/hello.bf",
+    text: "\talpha = 1;\n",
+  });
+  check("format returns an edit that removes the tab",
+    formatted.total >= 1 && formatted.edits.every((edit) => !edit.text.includes("\t")),
+    JSON.stringify(formatted));
+
+  const unknown = await rejects(() => host.request("lsp", "explain", {}), "METHOD_NOT_FOUND");
+  check("an unknown lsp method is METHOD_NOT_FOUND", !/^(wrong error|nothing was thrown)/.test(`${unknown}`), `${unknown}`);
+
+  await host.stop("lsp");
+  check("stopping the lsp subsystem leaves it stopped", host.state("lsp") === "stopped", host.state("lsp"));
 }
 
 section("independence from the kernel");

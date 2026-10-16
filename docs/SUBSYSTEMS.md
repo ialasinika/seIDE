@@ -82,43 +82,64 @@ another subsystem.
 ## The seam: where the process comes from
 
 The host owns *lifetimes*, not *processes*. A `process` subsystem is handed a
-channel factory by whoever owns child processes today, and today that is
-nobody: the shell constructs `SubsystemHost` without `spawn`, so a `process`
-descriptor fails fast with `SUBSYSTEM_UNSUPPORTED` and a sentence explaining
-why. A `builtin` subsystem needs no process at all, and the first one — `words`
-— is a builtin on purpose, because it is what remains when no server exists.
+channel factory by whoever owns child processes, and that is the kernel:
+`subsystems/host.mjs` is constructed with `spawn: (spec) => procs.open(spec)`,
+where `procs` is the shell's `ProcChannels` over the kernel's `proc.*` methods.
+A `builtin` subsystem needs no process at all, and the first one — `words` — is
+a builtin on purpose, because it is what remains when no server exists.
 
-Wiring the factory is one code path with two candidates:
+The seam is one function:
 
-- **A. the kernel's duplex channel.** `core/` already owns child processes
-  (`core/include/exec.h`, `core/src/exec.c`), but the pipe is read-only: stdin
-  goes to the NUL device so a runner can never eat the protocol stream. The
-  work is to make it duplex (`proc.open/send/close/list`, one `WriteFile`-safe
-  write path per channel) and to rename the runner-shaped vocabulary to a
-  process-shaped one. This keeps the promise `core/include/exec.h` already
-  makes — the kernel owns child processes so the shell does not have to — and
-  it is the only option that lets a non-shell client use subsystems.
-- **B. the shell spawns children itself.** Zero kernel change, a smaller diff,
-  but two owners of child processes in one program, and only clients that speak
-  to the shell can use a subsystem.
+```js
+spawn({ subsystem, command, cwd, env }) -> { write(text), onOutput(cb), onExit(cb), kill() }
+```
 
-Nothing above this line changes either way: same descriptors, same four
-methods, same states, same error codes. That is the point of putting the seam
-there.
+Which is exactly the kernel's contract: `proc.start` gives a run id,
+`proc.send` writes to the child, `proc.close` closes its input, `proc.stop`
+kills it, and `proc.output` / `proc.exit` are the callbacks. The path is
+
+    host → spawn(spec) → shell ProcChannels → proc.start/send/close/stop
+         → kernel proc module → WriteFile / reader threads → the server
+
+so a subsystem is a *process* and the kernel never learns what a language server
+is. `core/include/proc.h` states the one promise the kernel makes: a duplex
+channel, at most 64 runs, and an output stream that is never allowed to block
+the request loop.
+
+`proc.*` exists because of this seam and for no other reason: the same five
+methods run a `runner` card. See `docs/PROTOCOL.md` for the wire and
+`core/port/proc_win32.c` for the pipes.
 
 ## What exists today
 
 Built and tested: the descriptor grammar and its rejections, the host (states,
 autostart, shared starts, failures, timeouts, stop-all), the four wire methods
 with notifications, the `words` builtin (word completion and three provable
-diagnostics, quieted by the tokenizer when `langs/` is present), and
-`node subsystems/selftest.mjs` — 97 checks, no kernel, no browser, no network.
+diagnostics, quieted by the tokenizer when `langs/` is present), the `lsp`
+adapter with a scripted server behind it, and the kernel's duplex channel. The
+suites are `node subsystems/selftest.mjs` (111 checks, no kernel, no browser, no
+network, including a real child running `lsp-stub.mjs`), `node shell/web/selftest.mjs`
+(130 checks of the client's language layer against fake channels) and `make test`,
+which drives the same descriptor through the shell and the real kernel.
 
-Not built yet, in the order they matter: the process seam (A or B above), an
-`lsp` subsystem (a real language server behind the same four methods), and the
-client side — a completion popup, diagnostics in the gutter, hover, go-to
-definition, and in-file find/replace — which is the largest of the three and
-the one a user actually sees.
+The `lsp` descriptor is pointed at the stub by default:
+
+```
+launch node "{here}/lsp-stub.mjs"
+```
+
+Replacing that line with `launch rust-analyzer` is the whole change; the wire
+code does not know what a Rust file is. The stub exists so the adapter has a
+server whose answers are predictable, not because a real one is unavailable —
+`rust-analyzer.exe` is on this machine.
+
+The client side exists too: the editor card asks for completions on `^Space`
+(with `Enter`/arrows, and the answer's source named in the status line), shows
+diagnostics in an issue strip that a click jumps to, and answers `^I` (hover),
+`F12` (definition) and `^.` / `^⇧.` (next and previous issue). `python
+tools/input_smoke.py` is the
+proof it works in a real browser: it types at a real card and reads the rows
+back, over the kernel's own channel, with no server installed.
 
 Terminal, debugger and version control are the same shape as `lsp`: a
 descriptor, an adapter, and nothing new in the kernel or in this document.

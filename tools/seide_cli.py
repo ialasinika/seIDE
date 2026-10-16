@@ -74,7 +74,7 @@ LABEL_FIELDS = ("title", "file", "path", "cmd", "query", "filter")
 #: constant is the only place this tool commits to one.
 DOCUMENT_PATH = ".seide/board.json"
 
-#: `exec.stop` is asked for after this many seconds without an `exec.exit`.
+#: `proc.stop` is asked for after this many seconds without a `proc.exit`.
 DEFAULT_RUN_TIMEOUT = 60.0
 
 
@@ -330,7 +330,7 @@ def cmd_run(cli, args) -> int:
     params = {"cmd": command}
     if args.cwd:
         params["cwd"] = args.cwd
-    result = cli.request("exec.start", params) or {}
+    result = cli.request("proc.start", params) or {}
     run_id = result.get("run_id")
     print(f"run {run_id}: {command}", file=sys.stderr)
     deadline = time.monotonic() + args.timeout
@@ -347,17 +347,17 @@ def cmd_run(cli, args) -> int:
         if frame.get("run_id") != run_id:
             continue
         event = frame.get("event")
-        if event == "exec.output":
+        if event == "proc.output":
             text = frame.get("data") or ""
             if frame.get("stream") == "stderr":
                 sys.stderr.write(text)
             else:
                 write_out(text)
-        elif event == "exec.exit":
+        elif event == "proc.exit":
             code = frame.get("code")
             break
     if code is None:
-        cli.request("exec.stop", {"run_id": run_id})
+        cli.request("proc.stop", {"run_id": run_id})
         print(f"run {run_id}: still running after {args.timeout:g}s; stopped",
               file=sys.stderr)
         return 124
@@ -489,14 +489,25 @@ def cmd_selfcheck(args) -> int:
             check("the kernel keeps a document it cannot read, and refuses a stale write",
                   False, str(exc))
 
-        # 6. a real child: output over the notification stream, and its exit code.
+        # 6. a real child, both directions: what this client writes reaches the
+        #    child's stdin, what the child writes arrives as notifications, and
+        #    closing the input is how the child learns there is no more.
         try:
             child = scratch / "child.py"
             io.open(child, "w", encoding="utf-8", newline="\n").write(
-                "import sys\nprint('from-the-child')\nsys.exit(3)\n")
-            started = cli.request("exec.start",
+                "import sys\n"
+                "data = sys.stdin.read()\n"
+                "print('from-the-child:' + data.strip())\n"
+                "sys.exit(3)\n")
+            started = cli.request("proc.start",
                                  {"cmd": f'"{sys.executable}" "{child}"'}) or {}
             run_id = started.get("run_id")
+            written = cli.request("proc.send", {"run_id": run_id, "data": "ping\n"}) or {}
+            listed = cli.request("proc.list") or {}
+            runs = listed.get("runs") if isinstance(listed.get("runs"), list) else []
+            seen = [run for run in runs if run.get("run_id") == run_id]
+            closed = cli.request("proc.close", {"run_id": run_id}) or {}
+            after_close = refused(cli, "proc.send", {"run_id": run_id, "data": "again\n"})
             stdout_parts = []
             code = None
             deadline = time.monotonic() + 30.0
@@ -504,15 +515,20 @@ def cmd_selfcheck(args) -> int:
                 frame = cli.next_frame(1.0)
                 if frame is None or frame.get("run_id") != run_id:
                     continue
-                if frame.get("event") == "exec.output":
+                if frame.get("event") == "proc.output":
                     stdout_parts.append(frame.get("data") or "")
-                elif frame.get("event") == "exec.exit":
+                elif frame.get("event") == "proc.exit":
                     code = frame.get("code")
-            ok = code == 3 and "from-the-child" in "".join(stdout_parts)
-            check("a run's output and exit code arrive as notifications", ok,
-                  f"code={code} stdout={''.join(stdout_parts).strip()!r}")
+            text = "".join(stdout_parts)
+            ok = (written.get("written") == 5 and closed.get("closed") is True
+                  and len(seen) == 1 and after_close.code == 1005
+                  and code == 3 and "from-the-child:ping" in text)
+            check("a run's input, output and exit code all cross the channel", ok,
+                  f"written={written.get('written')} listed={len(seen)} "
+                  f"closed={closed.get('closed')} after_close={after_close.code} "
+                  f"code={code} stdout={text.strip()!r}")
         except Exception as exc:
-            check("a run's output and exit code arrive as notifications", False, str(exc))
+            check("a run's input, output and exit code all cross the channel", False, str(exc))
 
         # 7. the boundary: `lang.*` is the shell's, not the kernel's, and this
         #    client talks to the kernel.

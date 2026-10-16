@@ -33,7 +33,10 @@ reach into the iframe and do what a person does:
    and ctrl+wheel over the card must still zoom;
 7. drive the editor card's own keys -- Tab and shift+Tab on the file, Enter
    after an opener, Ctrl+F and the find bar, replace-all and Escape -- and read
-   the buffer and the painted hits back out of the DOM;
+   the buffer and the painted hits back out of the DOM; then ask it for
+   completions with Ctrl+Space (Enter takes the highlighted one, Escape closes
+   the list) and put a TODO and an unclosed parenthesis in the buffer to read
+   the issue strip and click a row to check the caret lands on the text it names;
 8. select more than one card -- Ctrl+A, ctrl+click, a shift+drag band, a group
    drag and a group Delete with one Ctrl+Z -- and read the counts and the
    positions back out;
@@ -77,7 +80,10 @@ WRAPPER = bs.REPO_ROOT / "shell" / "web" / WRAPPER_NAME
 #: test deletes it whether or not the checks got as far as doing so.
 SCRATCH = bs.REPO_ROOT / "build" / "__watch_smoke.txt"
 RESULT_RE = re.compile(r'<pre id="result">(.*?)</pre>', re.S)
-BUDGET_MS = 45000
+#: Wall-clock the page is allowed, in virtual time.  The language checks ask a
+#: real subsystem over the kernel's own channel -- and the first question pays
+#: for starting a process -- so the run needs more room than typing alone did.
+BUDGET_MS = 60000
 
 PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>input smoke</title>
@@ -90,6 +96,33 @@ pre{white-space:pre-wrap}</style></head>
 const frame = document.getElementById("app");
 const out = [];
 const say = (line) => { out.push(line); document.getElementById("result").textContent = out.join("\\n"); };
+/* Every exception the app throws is invisible from out here: the DOM simply does
+   not change, and a check that waits for a row reads that as "no rows".  The
+   editor's issue strip was dead for exactly that reason -- a missing import threw
+   inside a listener -- while this file went on calling the strip empty.  So the
+   app's own errors are collected and reported, and they fail the run. */
+const pageErrors = [];
+const ERRORS_KEPT = 50;
+const noteError = (message) => {
+  if (pageErrors.length < ERRORS_KEPT) {
+    pageErrors.push(message);
+  } else if (pageErrors.length === ERRORS_KEPT) {
+    pageErrors.push("(more errors, not kept)");
+  }
+};
+const watchErrors = () => {
+  const w = frame.contentWindow;
+  if (!w || w.__inputSmokeWatched === true) return;
+  w.__inputSmokeWatched = true;
+  w.addEventListener("error", (event) => {
+    noteError(String((event && event.message) || event));
+  });
+  w.addEventListener("unhandledrejection", (event) => {
+    const reason = event && event.reason;
+    noteError(String((reason && reason.message) || reason || event));
+  });
+};
+frame.addEventListener("load", watchErrors);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const cardCount = () => frame.contentDocument.querySelectorAll("#cards [data-card-id]").length;
 const logTail = () => {
@@ -188,6 +221,7 @@ async function main() {
   if (!(await ready())) { say("RESULT: FAILED -- the app never reached kernel ready"); return; }
   say("kernel ready: true");
   const doc = frame.contentDocument, win = frame.contentWindow;
+  watchErrors();
   await sleep(400);
 
   const before = cardCount();
@@ -328,6 +362,82 @@ async function main() {
       const restoredByUndo = area.value === beforeUndo;
       editorOk = editorOk && typed && undid === true && restoredByUndo;
       say("editor-undo: typed=" + typed + " command=" + undid + " restored=" + restoredByUndo);
+
+      /* Language, through the real keys: ^Space asks a subsystem for
+         completions and the rows dock under the editor, Enter takes the
+         highlighted one and closes the list.  The answer comes from the
+         built-in `words` subsystem, so no language server has to be running
+         for this to be true. */
+      const completion = doc.querySelector('[data-card-id="c1"] [data-role="completion"]');
+      const completionRows = () => doc.querySelectorAll('[data-card-id="c1"] [data-role="completion-row"]');
+      area.value = "const alphaOne = 1;\\nconst alphabet = alpha";
+      area.dispatchEvent(new win.Event("input", { bubbles: true }));
+      area.focus();
+      area.setSelectionRange(area.value.length, area.value.length);
+      press(" ", { ctrlKey: true });
+      await waitUntil(() => completionRows().length > 0, 40, 100);
+      const labels = [...completionRows()].map((row) => row.textContent).join(",");
+      const highlighted = doc.querySelectorAll('[data-card-id="c1"] .ed-complete-row.on').length;
+      const listed = completion !== null && completion.hidden === false
+        && completionRows().length >= 2 && highlighted === 1
+        && labels.indexOf("alphabet") !== -1;
+      const chosen = completionRows().length > 0 ? completionRows()[0].textContent : "";
+      say("editor-complete: " + listed + " shown=" + completionRows().length
+        + " labels=" + JSON.stringify(labels)
+        + " source=" + JSON.stringify(completion === null ? "" : String(completion.dataset.source || "")));
+      press("Enter");
+      const accepted = completion !== null && completion.hidden === true
+        && area.value.endsWith(chosen);
+      if (completionRows().length > 0 || !accepted) {
+        // A list that stays up, or an insert that did not land, is a failure
+        // worth seeing the text for.
+        say("editor-complete-accept: value=" + JSON.stringify(area.value) + " chosen=" + JSON.stringify(chosen));
+      }
+      editorOk = editorOk && listed && accepted;
+
+      /* Escape closes the list without touching the text, and the text is put
+         back to something with an issue in it: a stray brace is an error. */
+      press(" ", { ctrlKey: true });
+      await waitUntil(() => completionRows().length > 0, 40, 100);
+      const beforeEscape = area.value;
+      press("Escape");
+      const escaped = completion !== null && completion.hidden === true && area.value === beforeEscape;
+      editorOk = editorOk && escaped;
+
+      /* The issue strip.  The buffer carries the two things a language server
+         reports about it -- a TODO and an unclosed parenthesis -- and the rows
+         have to name them in the severities the server chose. */
+      const issueRows = () => doc.querySelectorAll('[data-card-id="c1"] [data-role="issue-row"]');
+      const issueBar = doc.querySelector('[data-card-id="c1"] [data-role="issues"]');
+      const issueBarSource = () => (issueBar === null ? "" : String(issueBar.dataset.source || ""));
+      area.value = "const a = 1; // TODO\\nconst b = (2;\\n";
+      area.dispatchEvent(new win.Event("input", { bubbles: true }));
+      await waitUntil(() => issueRows().length > 0, 60, 100);
+      const issueTexts = [...issueRows()].map((row) => row.textContent || "");
+      const severities = [...issueRows()].map((row) => row.dataset.severity).join(",");
+      const todoRow = [...issueRows()].find((row) => (row.textContent || "").indexOf("TODO") !== -1) || null;
+      const issueOk = issueRows().length >= 2
+        && severities.indexOf("warning") !== -1 && severities.indexOf("error") !== -1;
+      say("editor-issues: " + issueOk + " rows=" + issueRows().length
+        + " severities=" + JSON.stringify(severities)
+        + " first=" + JSON.stringify(issueTexts.length > 0 ? issueTexts[0] : "")
+        + " source=" + JSON.stringify(issueBarSource())
+        + " answer=" + JSON.stringify(issueBar === null ? "" : String(issueBar.dataset.answer || ""))
+        + " hidden=" + (issueBar === null ? "no-bar" : String(issueBar.hidden))
+        + " path=" + JSON.stringify(area.value.length)
+        + " | log: " + logTail());
+      /* Clicking the row that names the TODO puts the caret on the TODO. */
+      const wanted = area.value.indexOf("TODO");
+      if (todoRow !== null) {
+        todoRow.dispatchEvent(new win.MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      }
+      const caretOnIssue = area.selectionStart;
+      const jumped = todoRow !== null && wanted !== -1 && caretOnIssue === wanted;
+      if (!jumped) {
+        say("editor-issue-jump: caret=" + caretOnIssue + " wanted=" + wanted
+          + " value=" + JSON.stringify(area.value));
+      }
+      editorOk = editorOk && issueOk && jumped;
     }
   } catch (error) {
     editorOk = false;
@@ -621,9 +731,8 @@ async function main() {
       if (body.error) throw new Error(method + ": " + body.error.message);
       return body.result;
     };
-    const outside = (text) => rpc("exec.start", {
+    const outside = (text) => rpc("proc.start", {
       cmd: 'cmd /c echo ' + text + '> "' + nativePath + '"',
-      card_id: "",
     });
     /* Waiting for that child is a *real* wait: every probe is a round trip to
        the host, and virtual time stands still while a request is in flight. */
@@ -713,7 +822,7 @@ async function main() {
       + " status=" + JSON.stringify(statusOf(held)));
 
     /* The file disappears under the card.  Said, not silently written back. */
-    await rpc("exec.start", { cmd: 'cmd /c del "' + nativePath + '"', card_id: "" });
+    await rpc("proc.start", { cmd: 'cmd /c del "' + nativePath + '"' });
     const gone = await vanished();
     const reported = gone !== null
       && await waitUntil(() => statusOf(held).indexOf("gone from disk") !== -1, 60, 250);
@@ -868,9 +977,12 @@ async function main() {
     say("classic-error: " + (error && error.message ? error.message : String(error)));
   }
 
-  say("RESULT: " + (ok && wheelOk && editorOk && selectOk && searchOk && frameOk && watchOk && classicOk
-    ? "undo, redo, wheel ownership, the editor keys, multi-select, a workspace search, a frame, a watched file and the classic view work in a real browser"
-    : "FAILED -- see the counts, wheel, editor, select, search, frame, watch and classic lines above"));
+  say("page errors: " + (pageErrors.length === 0
+    ? "none"
+    : pageErrors.length + " " + JSON.stringify(pageErrors.slice(-4))));
+  say("RESULT: " + (pageErrors.length === 0 && ok && wheelOk && editorOk && selectOk && searchOk && frameOk && watchOk && classicOk
+    ? "undo, redo, wheel ownership, the editor keys, language completions and issues, multi-select, a workspace search, a frame, a watched file and the classic view work in a real browser"
+    : "FAILED -- see the counts, wheel, editor, select, search, frame, watch, classic and page-error lines above"));
   document.title = "input smoke done";
 }
 
@@ -887,7 +999,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Boot the real app in the system browser, make a board change, press "
             "Ctrl+Z and Ctrl+Shift+Z, dispatch a wheel over a card's own scroll "
             "region and over the board, and drive the editor card's indent, "
-            "auto-indent, find and replace keys, then select with Ctrl+A, "
+            "auto-indent, find and replace keys, ask it for completions with "
+            "^Space and read the issue strip, then select with Ctrl+A, "
             "ctrl+click and a shift+drag rubber band, drag the group and delete "
             "it, and finally search the workspace with `find`, open a hit at "
             "its line, frame a whole selection with `group` and take the frame "
@@ -959,6 +1072,8 @@ def parse_editor(body: str) -> dict:
         ("next", r'editor-find-next: count="([^"]*)" current=(\d+)'),
         ("replace", r'editor-replace: "([^"]*)" closed=(\w+)'),
         ("undo", r"editor-undo: typed=(\w+) command=(\w+) restored=(\w+)"),
+        ("complete", r'editor-complete: (true|false) shown=(\d+) labels="([^"]*)" source="([^"]*)"'),
+        ("issues", r'editor-issues: (true|false) rows=(\d+) severities="([^"]*)" first="([^"]*)"'),
     )
     for key, pattern in patterns:
         match = re.search(pattern, body)
@@ -1066,6 +1181,25 @@ def parse_classic(body: str) -> dict:
     return found
 
 
+def parse_page_errors(body: str) -> dict:
+    """The exceptions the app threw, as the wrapper's error listeners caught them.
+
+    A listener that throws changes no DOM node, so every other check in this file
+    reads it as "nothing happened" -- the wrapper reports the count so that a dead
+    feature cannot pass as an absent one.
+    """
+    match = re.search(r"^page errors: (.+)$", body, re.MULTILINE)
+    if match is None:
+        return {"count": -1, "detail": "no 'page errors' line -- the page never got that far"}
+    if match.group(1).strip() == "none":
+        return {"count": 0, "detail": ""}
+    count = re.match(r"(\d+)", match.group(1))
+    return {
+        "count": int(count.group(1)) if count is not None else -1,
+        "detail": match.group(1).strip(),
+    }
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.timeout <= 0:
@@ -1081,7 +1215,7 @@ def main(argv=None) -> int:
         edge = bs.find_edge(args.edge)
     except bs.DriverError as exc:
         print(f"[SKIP] no browser available: {exc}")
-        print("summary: 0 passed, 0 failed, 34 skipped (no browser)")
+        print("summary: 0 passed, 0 failed, 37 skipped (no browser)")
         return 0
 
     backup = bs.BoardBackup(bs.BOARD_PATH)
@@ -1142,6 +1276,10 @@ def main(argv=None) -> int:
     counts = parse_counts(body)
     booted = "kernel ready: true" in body
     results.check("the app boots in an iframe and reaches kernel ready", booted)
+    errors = parse_page_errors(body)
+    results.check("the app threw nothing while it was driven", errors["count"] == 0,
+                  (f"{errors['count']} exception(s): {errors['detail']}" if errors["count"] > 0
+                   else errors["detail"]))
     results.check("a double-click on empty space adds a card",
                   counts.get("added") == counts.get("boot", -1) + 1 if counts else False,
                   f"boot={counts.get('boot')} added={counts.get('added')}" if counts else "no counts")
@@ -1206,6 +1344,15 @@ def main(argv=None) -> int:
         else:
             detail = f"no editor-{key} line"
         results.check(name, got == want, detail)
+
+    complete = editor.get("complete")
+    results.check("^Space asks the language subsystem and Enter takes a completion",
+                  complete is not None and complete[0] == "true" and complete[3] == "lsp",
+                  " ".join(complete[1:]) if complete else "no editor-complete line")
+    issues = editor.get("issues")
+    results.check("a stray brace becomes an issue row and clicking it moves the caret there",
+                  issues is not None and issues[0] == "true",
+                  " ".join(issues[1:]) if issues else "no editor-issues line")
 
     select = parse_select(body)
 

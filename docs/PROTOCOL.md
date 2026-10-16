@@ -72,7 +72,7 @@ clients should branch on `name`, not on `message`.
 ### Notifications
 
 ```json
-{"event":"exec.output","run_id":1,"stream":"stdout","data":"Hello World!\n"}
+{"event":"proc.output","run_id":1,"stream":"stdout","data":"Hello World!\n"}
 ```
 
 Notifications carry `event` and have **no `id`**. They may appear between
@@ -83,9 +83,9 @@ responses at any time. The event list is below.
 ## The kernel method table
 
 The authoritative table is `sde_methods[]` in `core/src/rpc.c`. With both
-compile-time switches on (`SDE_WITH_VIEW`, `SDE_WITH_EXEC`) there are eleven
-methods. `view.*` disappears when `SDE_WITH_VIEW` is 0; `exec.*` disappears
-when `SDE_WITH_EXEC` is 0.
+compile-time switches on (`SDE_WITH_VIEW`, `SDE_WITH_PROC`) there are thirteen
+methods. `view.*` disappears when `SDE_WITH_VIEW` is 0; `proc.*` disappears
+when `SDE_WITH_PROC` is 0.
 
 | method | parameters | result |
 | --- | --- | --- |
@@ -97,9 +97,11 @@ when `SDE_WITH_EXEC` is 0.
 | `file.stat` | `path` | `{path, exists, dir, size, mtime, revision}` |
 | `view.load` | `path` | `{path, revision, document}` |
 | `view.save` | `path`, `document`, `base_revision?` | `{path, revision, saved}` |
-| `exec.start` | `cmd`, `card_id?`, `cwd?` | `{run_id}` |
-| `exec.stop` | `run_id` | `{stopped}` |
-| `exec.list` | none | `{runs}` |
+| `proc.start` | `cmd`, `cwd?` | `{run_id}` |
+| `proc.send` | `run_id`, `data` | `{written}` |
+| `proc.close` | `run_id` | `{closed}` |
+| `proc.stop` | `run_id` | `{stopped}` |
+| `proc.list` | none | `{runs}` |
 
 `?` marks an optional member. Members marked without `?` are required; omitting
 or mis-typing them produces `-32602 INVALID_PARAMS`.
@@ -107,11 +109,18 @@ or mis-typing them produces `-32602 INVALID_PARAMS`.
 ### `hello`
 
 ```json
-{"protocol":2,"protocol_name":"seide/2","kernel_version":"0.3.0-alpha.1","root":"C:/codes/seIDE","pid":12345}
+{"protocol":3,"protocol_name":"seide/3","kernel_version":"0.3.0-alpha.1","root":"C:/codes/seIDE","pid":12345}
 ```
 
 `protocol` is the integer a client can compare; `protocol_name` is the same
 version spelled out for a human reading a log line.
+
+`seide/3` is the version that made a child process a *channel* instead of a
+runner: `exec.*` became `proc.*`, `card_id` disappeared from the protocol
+altogether, and a client can now write to a child's standard input and close it
+(`proc.send`, `proc.close`). A language server needs exactly that and nothing
+else, which is why the rename happened in one step rather than two. See
+`docs/SUBSYSTEMS.md`.
 
 `seide/2` is the version that made the view document opaque: the kernel stores a
 client's document, hands it back, and has no opinion about what is inside it.
@@ -347,36 +356,59 @@ file and the held document untouched. The write itself is atomic: a neighbour
 file is replaced into place, so a reader or a crash sees the whole old document
 or the whole new one.
 
-### `exec.start`
+### `proc.start`
 
 | parameter | type | meaning |
 | --- | --- | --- |
-| `cmd` | string, required | passed to the platform's child-process spawner |
-| `card_id` | string, optional | defaults to `""`; echoed on the run and its events |
+| `cmd` | string, required | a command line; the platform parses it, so an executable plus arguments |
 | `cwd` | string, optional | resolved through the workspace; empty/absent means the workspace root |
 
 Result: `{"run_id":1}`.
 
+There is no `card_id`: the kernel does not know which card, view or subsystem
+asked. That is the client's business, and a run id is enough to match events to
+the thing that started it.
+
 A `cwd` that escapes the workspace is refused with `-32602 INVALID_PARAMS`.
-A process that cannot start is `1005 EXEC`. Runs are capped at 64 live entries;
+A process that cannot start is `1005 PROC`. Runs are capped at 64 live entries;
 when the table is full the kernel drops the oldest **finished** run, and if
 every run is still alive it lets the table grow instead.
 
-### `exec.stop`
+### `proc.send`
+
+| parameter | type | meaning |
+| --- | --- | --- |
+| `run_id` | number, required | which run |
+| `data` | string, required | UTF-8 bytes for the child's standard input |
+
+Result: `{"written":<bytes>}`. The write is queued and a writer thread drains it,
+so a child that reads slowly cannot block the kernel: `written` is what was
+accepted, and a queue that is full is refused with `1005 PROC`
+(`the process is not reading its input`) rather than waited on. After
+`proc.close` a further `proc.send` is the same `1005`.
+
+### `proc.close`
+
+Parameter: `run_id`. Result: `{"closed":true}`. The child's standard input is
+closed, which is how a program that reads until EOF learns there is no more; the
+run itself stays alive until it exits or is stopped. An unknown id is
+`1002 NOT_FOUND`.
+
+### `proc.stop`
 
 Parameter: `run_id` (number; a non-number is `-32602` with
 `` `run_id` must be a number ``). Result: `{"stopped":true}`. An unknown id is
 `1002 NOT_FOUND` with `no such run`.
 
-### `exec.list`
+### `proc.list`
 
 ```json
-{"runs":[{"run_id":1,"card_id":"c3","cmd":"python tools/bf.py examples/hello.bf","running":false,"code":0,"started":1700000000000}]}
+{"runs":[{"run_id":1,"cmd":"python tools/bf.py examples/hello.bf","running":false,"code":0,"started":1700000000000}]}
 ```
 
 `code` is `-1` while the run is alive or was killed. `started` is
 `sde_port_now_ms()` (milliseconds since the platform epoch). There is **no
-`pid` member**, despite the header comment mentioning one.
+`pid` member**, despite the header comment mentioning one, and no `card_id`.
 
 ---
 
@@ -386,12 +418,12 @@ Parameter: `run_id` (number; a non-number is `-32602` with
 | --- | --- | --- |
 | `file.changed` | `path`, `revision` | a successful `file.write` |
 | `view.changed` | `path`, `revision` | a successful `view.save` |
-| `exec.output` | `run_id`, `stream`, `data` | the pump read bytes from a child |
-| `exec.exit` | `run_id`, `code` | a child exited and every byte was consumed |
+| `proc.output` | `run_id`, `stream`, `data` | the pump read bytes from a child |
+| `proc.exit` | `run_id`, `code` | a child exited and every byte was consumed |
 | `log` | `message` | the transport dropped an oversized frame |
 
-`exec.output.stream` is `"stdout"` or `"stderr"`. Each output notification
-carries at most 8192 bytes (`SDE_EXEC_READ_MAX`), one read per run per 15 ms
+`proc.output.stream` is `"stdout"` or `"stderr"`. Each output notification
+carries at most 8192 bytes (`SDE_PROC_READ_MAX`), one read per run per 15 ms
 pass, which keeps a chatty process from starving the others.
 
 The shell's board UI reacts to `view.changed` by ignoring its own revision echo;
@@ -458,10 +490,10 @@ Three things about it are the point:
 | code | name | when |
 | --- | --- | --- |
 | 1001 | `STALE_REVISION` | `file.write` or `view.save` with an out-of-date `base_revision`; carries `data.current_revision` |
-| 1002 | `NOT_FOUND` | `file.read` on an absent file; `exec.stop` on an unknown run |
+| 1002 | `NOT_FOUND` | `file.read` on an absent file; `proc.stop` or `proc.close` on an unknown run |
 | 1003 | `IO` | read/write/list/save failures not covered above |
 | 1004 | *(retired)* | was `INVALID_BOARD`; the kernel no longer validates a document, so nothing emits it. The number stays reserved: a client that reads `1004` from an older kernel is looking at a fork or at `seide/1` |
-| 1005 | `EXEC` | a child process could not be started |
+| 1005 | `PROC` | a child process could not be started, could not be written to, or its input is closed |
 
 `INVALID_PARAMS` messages are uniform: the helper that reads a required string
 emits ``missing non-empty string `KEY` `` naming the parameter.

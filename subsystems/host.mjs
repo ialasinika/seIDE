@@ -234,9 +234,17 @@ export function loadSubsystems(dir, { onError = null } = {}) {
  *
  *     spawn({ subsystem, command, cwd, env }) -> channel
  *
- * A channel is `{ write(text), onOutput(cb), onExit(cb), kill() }`.  With no
- * factory the host still loads, lists and starts builtins; a process subsystem
- * answers `SUBSYSTEM_UNSUPPORTED` and says why.
+ * A channel is `{ write(text), onOutput(cb), onExit(cb), kill() }`.  `cb` is
+ * called as `cb(data, stream)`, where `stream` is `"stdout"` or `"stderr"`, so
+ * a subsystem that speaks a framed protocol can ignore diagnostics chatter.
+ * With no factory the host still loads, lists and starts builtins; a process
+ * subsystem answers `SUBSYSTEM_UNSUPPORTED` and says why.
+ *
+ * `root` is the workspace the subsystems were loaded for, as an absolute path
+ * (or `null` when the host has none).  It is handed to every adapter as
+ * `context.root`, because a subsystem that has to name a file to a server --
+ * a language server, a formatter -- needs an absolute path and the client only
+ * ever speaks paths relative to the workspace.
  */
 export class SubsystemHost {
   constructor({
@@ -245,12 +253,14 @@ export class SubsystemHost {
     importModule = (url) => import(url),
     onEvent = null,
     requestTimeoutMs = 5000,
+    root = null,
   } = {}) {
     this.descriptors = new Map(descriptors.map((descriptor) => [descriptor.id, descriptor]));
     this.spawn = typeof spawn === "function" ? spawn : null;
     this.importModule = importModule;
     this.onEvent = typeof onEvent === "function" ? onEvent : () => {};
     this.requestTimeoutMs = requestTimeoutMs;
+    this.root = typeof root === "string" && root !== "" ? root : null;
     this.instances = new Map();
   }
 
@@ -322,6 +332,7 @@ export class SubsystemHost {
     const context = {
       id: descriptor.id,
       descriptor,
+      root: this.root,
       log: (message) => this.#emit({ event: "subsystem.log", id: descriptor.id, message: String(message) }),
       emit: (event) => this.#emit({ ...event, id: descriptor.id }),
       spawn: (spec) => {

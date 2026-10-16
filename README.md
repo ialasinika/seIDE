@@ -30,7 +30,10 @@ without fighting a plugin API, keep reading.
 - A **window** made of the system's Edge/Chromium launched in
   `--app=http://127.0.0.1:PORT` app mode.
 - **Languages** that are actually supported: Brainfuck, plus an SGML family
-  (HTML and XML, which is what SVG is). Colouring only — see below.
+  (HTML and XML, which is what SVG is) — for colouring — and a **subsystem
+  layer** (`subsystems/`) that answers completion, diagnostics, hover,
+  definition and format, either from a built-in or from a process over
+  `proc.*`. Nothing of it is in the kernel; see below.
 - A **frozen JSON-RPC protocol** on stdio, newline-delimited, with a documented
   method list and error-code table.
 
@@ -44,10 +47,13 @@ without fighting a plugin API, keep reading.
   forking this repository and editing the source.
 - **Not a native window.** The app mode of a browser is not a real application
   window; see the WRY/Tauri note below.
-- **Not for every language.** IntelliSense, diagnostics, completion and
-  formatting do not exist. Language support is keyword colouring, and the only
-  languages that must work are Brainfuck and the SGML family (HTML/XML); see
-  [Constraints, 8](#8-language-intelligence-is-keyword-colouring-and-it-lives-in-langs).
+- **Not a language server.** Completion, diagnostics, hover, definition and
+  formatting edits do reach the editor — through `subsystems/`, with `words` (a
+  built-in over the buffer) or `lsp` (a language server over `proc.*`) answering
+  today — but the results are a docked list and an issue strip rather than a
+  popup at the caret, hover prints to the log rather than opening a frame, and
+  colouring is still keywords, not a parse tree; see
+  [Constraints, 8](#8-language-support-is-colouring-plus-a-deletable-subsystem-layer).
 - **Not portable yet.** The kernel's platform layer is Win32.
 
 ---
@@ -159,17 +165,24 @@ rejected by `-std=c89 -pedantic -Werror`.
 | `langs/`, `shell/` | JavaScript ESM | zero npm dependencies |
 | `tools/` | Python 3.12 | standard library only |
 
-### 8. Language intelligence is keyword colouring, and it lives in `langs/`
+### 8. Language support is colouring plus a deletable subsystem layer, and neither is in the kernel
 
 The kernel knows about files, documents and processes — not about programming
-languages. Language support lives in `langs/`, is served by the shell, and is
+languages. Keyword colouring lives in `langs/`, is served by the shell, and is
 **deletable**: `rm -rf langs/` leaves a kernel that still builds and a shell that
-still runs, rendering plain text. Two kinds of language must be supported: the
-**flat** kind (Brainfuck is the worked example — a line comment, a string
-delimiter and a list of tokens) and the **SGML family** (HTML and XML, which is
-what SVG, RSS and the rest of the `.xml` extensions are), whose delimiters are
-SGML's rather than any one language's. See `docs/ARCHITECTURE.md`,
-`langs/README.md` and `docs/PROTOCOL.md`.
+still runs, rendering plain text. Anything that has to be *asked* — a completion,
+a diagnostic, a hover, a definition, a formatting edit — goes through
+`subsystems/`, which is deletable in the same way and carries the same rule as a
+descriptor: a `.sub` file says what a subsystem can answer, the host routes on
+that, and the answer arrives whether it came from a JavaScript built-in (`words`)
+or from a process (`lsp`, a language server spoken to over `proc.*`). Neither
+layer is allowed to become something the kernel has to know about. Two kinds of
+language must be supported: the **flat** kind (Brainfuck is the worked example —
+a line comment, a string delimiter and a list of tokens) and the **SGML family**
+(HTML and XML, which is what SVG, RSS and the rest of the `.xml` extensions are),
+whose delimiters are SGML's rather than any one language's. See
+`docs/ARCHITECTURE.md`, `docs/SUBSYSTEMS.md`, `langs/README.md` and
+`docs/PROTOCOL.md`.
 
 ---
 
@@ -205,7 +218,7 @@ Run the checks:
 C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile check       # kernel alone: 9 passed, 0 failed, 4 skipped
 C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile fullcheck   # whole endpoint: 13 passed, 0 failed, 0 skipped
 C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile probe       # every bug in docs/BUGS.md: all ok
-C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile smoke       # the window, headless: 5 + 34 checks, 0 failed
+C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile smoke       # the window, headless: 5 + 37 checks, 0 failed
 C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile version-check  # every copy agrees, and the changelog has a home for it
 C:/mingw64/mingw64/bin/mingw32-make.exe -f Makefile test        # check, fullcheck, probe, cli-check, version-check, the JSON test, both JS self-tests
 ```
@@ -218,16 +231,17 @@ python tools/e2e.py --seide build/seide.exe --keep-going
 python tools/kernel_probe.py                   # the fixed bugs: summary: all ok
 python tools/seide_cli.py selfcheck            # the second client, against a scratch workspace: summary: all ok
 python tools/browser_smoke.py                  # renders the real window; SKIP (exit 0) with no browser
-python tools/input_smoke.py                    # keys, wheel, the editor, multi-select, a search, a frame, a watched file and the classic view: 34 passed, 0 failed
+python tools/input_smoke.py                    # keys, wheel, the editor (incl. completions and the issue strip), multi-select, a search, a frame, a watched file and the classic view: 37 passed, 0 failed
 python tools/version.py check                  # every copy of the version, and the changelog section
 build/obj/test_json.exe                        # the C JSON codec: "all good"
 node langs/selftest.mjs                        # 92/92 checks passed
-node shell/web/selftest.mjs                    # ok 115/115 (pure JS: no DOM)
+node shell/web/selftest.mjs                    # ok 130/130 (pure JS: no DOM)
 ```
 
 `make test` runs `check`, then `fullcheck`, then `probe`, then `cli-check`, then
-`version-check`, then the JSON test and both JavaScript self-tests **in that
-order**, so a `fullcheck` failure would stop the run before the self-tests are
+`version-check`, then the JSON test and the three JavaScript self-tests
+(`langs/`, `subsystems/`, `shell/web/`) **in that order**, so a `fullcheck`
+failure would stop the run before the self-tests are
 reached. `cli-check` is the second consumer of the protocol: `tools/seide_cli.py`
 does its own eight checks against a scratch workspace with no shell code
 involved, which is what keeps the frozen contract honest (see
@@ -250,14 +264,21 @@ frame and checks every card inside it moved by the same delta, and runs
 from outside the app — the test writes it with a plain file write, then again
 with different bytes — and checks the card notices on its own and reloads, that
 a card with unsaved edits is warned instead of overwritten, and that deleting
-the file under a card is reported with the text still in the card. Last it types
+the file under a card is reported with the text still in the card. It then asks
+the `lsp` subsystem for completions with Ctrl+Space — checks the list came from
+`lsp` and not from the fallback — and takes one with Enter, waits for a `TODO`
+and an unclosed `(` to arrive as issue rows, clicks one and checks the caret went
+there. Last it types
 `mode classic` and measures the view in the board's own pixels — the tab strip
 under the HUD, the code area filling the right column and the sidebar the left,
 both ending on the board's bottom edge while every other card is hidden — clicks
 a tab and checks the code area moved to that file, wheels the code area and the
 strip to check the viewport did not move, and runs `mode board` to check every
 card, every size and the pan and zoom came back exactly
-(`input_smoke.py`, 34 checks). On a clone that has no
+(`input_smoke.py`, 37 checks). The wrapper also installs its own `error` and
+`unhandledrejection` listeners on the app's window and fails the run on any
+exception, because a listener that throws changes no DOM node: without that
+count a dead feature and an idle one look exactly alike. On a clone that has no
 board yet both install `examples/board.json` for the run and remove it again
 afterwards. As of this writing nothing fails.
 
@@ -358,9 +379,9 @@ CHANGELOG.md            what is in this version, and what is not
 .gitattributes          the checkout is the repository's bytes: LF everywhere
 
 core/                   the kernel -- C89, no dependencies
-  include/              public headers: buf, vec, json, port, wksp, view, exec,
+  include/              public headers: buf, vec, json, port, wksp, view, proc,
                         serve, rpc, app, module, seide_cfg
-  src/                  one file per module: buf, vec, json, wksp, view, exec,
+  src/                  one file per module: buf, vec, json, wksp, view, proc,
                         rpc, serve, app, main
   port/                 the only OS-aware code: sys_win32.c, proc_win32.c
   tests/                test_json.c (JSON round-trip harness for the kernel)
@@ -378,6 +399,9 @@ langs/                  language support, deliberately OUTSIDE the kernel
 subsystems/             capability outside the kernel, owned by the shell
   words.sub             the built-in: completion and diagnostics on any file
   words.mjs             its implementation -- no server, no network, no config
+  lsp.sub               a process subsystem: any language server over `proc.*`
+  lsp.mjs               LSP framing, lifecycle and request routing
+  lsp-stub.mjs          a scripted language server, for tests and for a demo
   host.mjs              descriptors, lifecycle, request routing, the channel seam
   selftest.mjs          node subsystems/selftest.mjs -- no kernel, no browser
   README.md             the descriptor grammar, the wire, the seam
@@ -385,8 +409,8 @@ subsystems/             capability outside the kernel, owned by the shell
 shell/                  the front end and the endpoints
   main.mjs              `seide rpc` (stdio) and `seide serve` (HTTP + SSE + browser)
   web/                  the board UI: index.html, style.css, board.mjs, cards.mjs,
-                        history.mjs, rpc.mjs, watch.mjs, classic.mjs, main.mjs,
-                        selftest.mjs, README.md
+                        history.mjs, language.mjs, rpc.mjs, watch.mjs,
+                        classic.mjs, main.mjs, selftest.mjs, README.md
 
 tools/                  Python 3.12, standard library only
   build.py              drives the Makefile; --check / --release / --clean

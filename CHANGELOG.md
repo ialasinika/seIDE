@@ -3,6 +3,97 @@
 What changed, in the order it changed.  This project is a prototype: the
 version number says how usable it is, not how finished.
 
+## Unreleased
+
+### Kernel
+
+- **The kernel's child processes gained the other half of the channel.**
+  `exec.*` is gone; `proc.start {cmd, cwd?}`, `proc.send {run_id, data}`,
+  `proc.close {run_id}`, `proc.stop {run_id}` and `proc.list` replace it, and
+  `core/src/exec.c` / `core/include/exec.h` became `core/src/proc.c` /
+  `core/include/proc.h` (`SDE_WITH_EXEC` -> `SDE_WITH_PROC`, `SDE_RPC_EXEC` ->
+  `SDE_RPC_PROC` = `1005`).  A run no longer carries a **`card_id`**: the kernel
+  never had a use for it, and a kernel that knows what a runner *card* is has
+  the board leak all over again.  Child stdin used to be the NUL device, so a
+  command could not be talked to; it is now a private pipe with a writer thread
+  inside `core/port/proc_win32.c` (bounded queue, `sde_proc_write` /
+  `sde_proc_close_input`), which is what makes `proc.send` safe: the RPC loop
+  never blocks on a child that has stopped reading its input.  Notifications are
+  `proc.output` / `proc.exit`.  `SDE_PROTOCOL_VERSION` is **3**.
+
+### Subsystems
+
+- New `subsystems/`: capability outside the kernel, owned by the shell, as a
+  sibling of `langs/`.  A `.sub` descriptor is data (`id`, `title`, `kind`,
+  `module`, `capabilities`, `autostart`, `launch`), the host owns lifetimes and
+  routing, and the wire is `subsystem.list` / `start` / `stop` / `request` plus
+  `subsystem.state` / `subsystem.log` / `subsystem.diagnostics`.  The kernel
+  gains nothing: it was already asked `subsystem.*` and answers
+  `METHOD_NOT_FOUND`, which is the point.
+- `words` is the first subsystem and needs no server: word completion from the
+  buffers and the project, and three diagnostics provable from the text alone
+  (unclosed or stray brackets, an unterminated block comment, an odd number of
+  quotes), quieted by the tokenizer when `langs/` is present and running on raw
+  text when it is not.
+- `lsp` is the first **process** subsystem: `Content-Length` framing,
+  `initialize`, `didOpen` / `didChange` / `didClose`, `completion`, `hover`,
+  `definition`, `formatting`, pushed diagnostics and a restart-safe failure
+  path.  It is the first real consumer of `proc.send`, and it is pointed at
+  `lsp-stub.mjs` — a scripted server that needs no toolchain — by one `launch`
+  line; a descriptor naming `rust-analyzer` or any other server changes nothing
+  above it.  The channel seam (`spawn(spec) -> {write, onOutput, onExit, kill}`)
+  is what keeps the host free of processes.
+- `shell/main.mjs` wires the two together (`ProcChannels` over `proc.*`) and
+  multiplexes `subsystem.*` beside `lang.*`; both `rpc` and `serve` share one
+  notification path, and a shell without a channel still lists builtins and
+  refuses a `process` subsystem with `SUBSYSTEM_UNSUPPORTED` and a reason.
+
+### Client
+
+- **The editor card speaks the subsystem contract.** A new `shell/web/language.mjs`
+  (pure, no DOM, injected transport) picks which subsystem answers a capability —
+  a running one first, then a builtin, then the lowest id — asks for completions,
+  diagnostics, hover, definition and format, and normalises the answers: LSP
+  ranges become line/column, a diagnostic with neither a message nor a code is
+  dropped, one that runs past the buffer is clamped, and a reply about text that
+  has since changed is thrown away rather than shown.  A subsystem that fails is
+  left alone for one round, so a dead server cannot make every keystroke wait.
+- Completions are a list docked under the editor, not a floating popup: a
+  `<textarea>` has no selection rectangle to read, and a mirror element would be
+  a second copy of the text that can disagree with the real one.  `^Space` opens
+  it, `Enter`/`Tab` takes the highlighted item, the arrows walk it, `Esc` closes
+  it, and the status line names which subsystem answered.  Diagnostics land in an
+  issue strip whose rows jump the caret to the diagnostic, with `^I` (hover),
+  `F12` (definition) and `^.` / `^⇧.` (next and previous issue).
+- The status line keeps the sentence that says *why* the card last loaded
+  ("loaded · crlf · 5 bytes" against "reloaded from disk" against "saved") when a
+  revision or an issue count under it is repainted; the difference between "this
+  editor read the file" and "the watcher noticed it change under you" is the
+  whole reason the sentence exists.
+
+### Tools
+
+- `tools/e2e.py`, `tools/input_smoke.py` and `tools/seide_cli.py` follow `proc.*`.
+  The e2e grew a duplex check — the harness writes a child's stdin, closes it,
+  sends again after the close to prove the `1005` refusal, and reads the child's
+  echo and exit code back through the one channel — and `seide_cli run` opens a
+  process, writes its input and streams `proc.output`.
+- `tools/input_smoke.py` drives `^Space`, the completion accept, an issue row and
+  the strip's click, and installs `error` / `unhandledrejection` listeners on the
+  app's window: the run now fails if the page threw anything, because a listener
+  that throws changes no DOM node and a dead feature used to read as an idle one.
+  This is how the editor's missing import was caught — the strip was created
+  hidden, the exception left it that way, and the check called it empty.
+
+### Docs
+
+- New `docs/SUBSYSTEMS.md` and `subsystems/README.md`: the descriptor grammar,
+  the frozen wire, the error codes, the lifecycle rules and the seam — and why
+  a layer with a frozen wire is still not the plugin system constraint 3
+  refuses.  `docs/PROTOCOL.md` documents the thirteen-method table and
+  `proc.*`; `README.md` gains the `subsystems/` map and the paragraph that says
+  what constraint 3 does and does not forbid.
+
 ## v0.3.0-alpha.1 — 2026-10-15
 ### Kernel
 

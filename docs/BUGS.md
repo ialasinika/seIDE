@@ -211,8 +211,10 @@ recording so a fork does not re-litigate it:
 - `params` as an array -- accepted and ignored, per JSON-RPC;
 - `file.read` of a directory -- `1003`; of a missing file -- `1002`; of a
   binary file -- `1003`;
-- `exec.stop` on an unknown run -- `1002`; with a non-numeric id --
-  `-32602`; `exec.start` of a command that does not exist -- `1005`;
+- `proc.stop` on an unknown run -- `1002`; with a non-numeric id --
+  `-32602`; `proc.start` of a command that does not exist -- `1005`;
+- `proc.send` after the input was closed -- `1005` (seide/3; the same rail
+  could not be asked before the channel had a write half);
 - the kernel exits cleanly shortly after stdin reaches EOF.
 
 ---
@@ -233,6 +235,14 @@ Regression evidence for this wave lives in
 `probe_host_fixes.mjs`, `probe_dispatch.mjs`) and `build/probes/kernel/`
 (`probe_fixes.py`).
 
+**A third pass** — the process channel (`proc.*`), the subsystem host and the
+client's language layer — added `N13` and the `## Subsystems` section below, plus
+bullets under `## Tools` and `## Browser layer`.  Its probes, its own findings
+write-up and two sabotage proofs (a suite that cannot go red is not evidence)
+live in `build/probes/subsystems/`: `FINDINGS.md`, `probe_lsp.mjs`,
+`probe_shell_lsp.mjs`, `probe_shell_diag.py`, `probe_lsp_race.mjs`, `eol_audit.py`,
+`sabotage_rank.mjs` and `sabotage_page_error.py`.
+
 ## Tools
 
 - **N1 — `tools/e2e.py` reset the board viewport on every run.** The suite
@@ -251,20 +261,35 @@ Regression evidence for this wave lives in
   `langs/lang.mjs` refuses.  It now scans quoted regions (`scan_quoted`) and
   verifies the descriptor it just wrote (`verify_descriptor`) before reporting
   success.
+- **N13 — `shell/web/selftest.mjs` never awaited its own async checks.** The
+  runner collected results through an `async` test function and dropped the
+  promise: it printed `N/N` and exited 0 even when a check threw.  That is why
+  the missing-import bug above could not be caught there -- the checks that would
+  have failed were the async ones.  The runner now keeps every pending test and
+  awaits them all before it reports.  Proved by breaking a check on purpose
+  (`assert.equal(asked.length, 99)`): the suite exits 1 and names it.
+- **`tools/input_smoke.py` could not see the app throw.** The wrapper drove a
+  page whose exceptions were invisible: a listener that throws changes no DOM
+  node, so a dead feature and an idle one looked identical and the run passed.
+  The wrapper now installs `error` / `unhandledrejection` listeners on the app's
+  window, prints `page errors: none` (or the last few), and fails on any of them;
+  the count is asserted by a check of its own.  This is what turned the dead
+  issue strip from a silent `rows=0` into a named exception.
 
 ## Kernel and protocol
 
-- **N3 — `exec` output was truncated at the first NUL byte and reported as
-  success.** A command printing `a\0b` produced `a` plus `exit 0`, so a runner
-  card showed a short output as if it were complete.
+- **N3 — the process module's output was truncated at the first NUL byte and
+  reported as success.** A command printing `a\0b` produced `a` plus `exit 0`,
+  so a runner card showed a short output as if it were complete.
 - **N4 — the kernel could emit raw non-UTF-8 bytes inside a JSON string**, which
   the shell then had to parse.  Both are fixed by one helper, `append_safe()` in
-  `core/src/exec.c`: every byte on its way into the output buffer is
+  `core/src/proc.c`: every byte on its way into the output buffer is
   UTF-8-validated, and anything invalid becomes U+FFFD, so the reported length is
   the real length and the frame stays well-formed.  Verified by
   `build/probes/lead/probe_exec_bytes.py` (`a\uFFFDb\uFFFDc€d`).
 - **N5 — `exec.stop` never emitted `exec.exit`.** A stopped run left runner
-  cards spinning forever; it now reports `exec.exit` with code -1.
+  cards spinning forever; it now (as `proc.stop`) reports `proc.exit` with code
+  -1.
 - **N7 — the board revision depended on JSON member order.** Two documents with
   identical content hashed differently depending on how the client spelled
   them, which made optimistic locking fire spuriously.  The new
@@ -329,6 +354,27 @@ Regression evidence for this wave lives in
   reaping the child it had already spawned; it now exits 1 promptly with no
   `seide.exe` left behind.
 
+## Subsystems (`subsystems/`)
+
+- **The `lsp` adapter answered `completion` and `diagnostics`; the client asked
+  `complete` and `diagnose`.** The adapter's `request()` dispatch used the LSP's
+  own method names while `subsystems/words.mjs` used the client's, so the builtin
+  quietly answered every question the process subsystem was asked and the process
+  subsystem was never asked one.  Nothing under Node caught it: the adapter's
+  selftest calls the adapter directly, and the client's checks call the client
+  directly.  It surfaced in `tools/input_smoke.py` as `source="words"` on a
+  question a language server should have answered, which is the whole argument
+  for the browser check -- two halves of one contract, tested apart, agree on
+  whatever each was written to say.  One vocabulary now (`complete`, `diagnose`,
+  `hover`, `definition`, `format`), and the smoke check requires `source="lsp"`.
+- **An honest `stale: true` answer was shown as "nothing is wrong".** The adapter
+  answers `stale` when the document's version moved after the question was asked:
+  an honest "I have not looked at this text yet".  The client took it as final, so
+  a buffer that had just changed could show no issues while the server was still
+  catching up.  `language.mjs`'s `diagnose` now asks again once with
+  `wait: 2000` -- the adapter's own wait-for-version window -- keeps `stale` in
+  the answer, and the strip's `data-answer` says so.
+
 ## Browser layer (`shell/web/`)
 
 Every entry below has a check in `shell/web/selftest.mjs` -- which grew from 46 to
@@ -390,6 +436,17 @@ their severity suggests.
   itself by `tools/input_smoke.py`, which dispatches a real wheel over the editor
   (`defaultPrevented=false`, the board does not move) and over the board
   (`defaultPrevented=true`, it pans).
+- **The editor's new issue strip was created and never painted.** `cards.mjs`
+  imported `LanguageClient` from `./language.mjs` but used `formatDiagnostic` and
+  `insertCompletion` too, so `diagnoseNow()` threw a `ReferenceError` inside an
+  async call and the strip stayed exactly as it was created: hidden.  Every check
+  in `tools/input_smoke.py` that waits for a row read that as "no rows", which is
+  also what an idle editor looks like; only the new issue check failed, and it
+  failed with no reason.  Fixed by importing what is used, and caught for good
+  two ways: the wrapper's `error` / `unhandledrejection` listeners now fail the
+  run (N13), and the strip writes its answer back as data (`data-answer`:
+  `2 of 2`, `none`, `no file`) so a shown-and-empty strip can be told from a
+  strip that never got an answer.
 - **The selftest printed one number for coverage it did not have.** It runs in
   Node with no DOM, yet reported only `N/N`.  It now says so in its header and in
   a final `note:` line printed on both pass and fail:

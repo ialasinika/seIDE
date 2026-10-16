@@ -28,7 +28,7 @@ SRC = \
 	core/src/json.c \
 	core/src/wksp.c \
 	core/src/view.c \
-	core/src/exec.c \
+	core/src/proc.c \
 	core/src/rpc.c \
 	core/src/serve.c \
 	core/src/app.c \

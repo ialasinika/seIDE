@@ -18,9 +18,9 @@ including when a check fails.
 The scenario asserted here is the frozen protocol exercised in order: hello,
 workspace.info, lang.list, lang.tokenize (plus its tiling property),
 file.read / file.write / stale write, path containment, the view document
-round-trip, the shipped starter board, and a real ``exec.start`` run whose stdout
-must contain the Brainfuck program's
-output.  The two write checks have to edit the fixture to move its revision
+round-trip, the shipped starter board, a real ``proc.start`` run whose stdout
+must contain the Brainfuck program's output, and the duplex channel a subsystem
+needs (``proc.send`` into a child's stdin, ``proc.close`` to end it).  The two write checks have to edit the fixture to move its revision
 (a revision is a content hash) and write the original bytes back afterwards, so
 a completed run leaves the file byte-identical.
 
@@ -86,8 +86,8 @@ INLINE_LF = INLINE_BF + "\n"
 #: runs to exactly the same output while it is edited.
 REVISION_PROBE = "\n# e2e: revision probe\n"
 
-#: The command handed to ``exec.start``; ``{python}``/``{bf}``/``{fixture}`` are filled in.
-EXEC_TEMPLATE = '"{python}" "{bf}" "{fixture}"'
+#: The command handed to ``proc.start``; ``{python}``/``{bf}``/``{fixture}`` are filled in.
+PROC_TEMPLATE = '"{python}" "{bf}" "{fixture}"'
 
 #: Where this suite keeps its document.  The kernel has no opinion: a view
 #: document's path is the *client's* convention, and this is the same one
@@ -1002,16 +1002,14 @@ def define_checks(h: Harness) -> list:
             "accepted and stored exactly"
         )
 
-    def exec_run():
-        result = client.call(
-            "exec.start", {"card_id": ctx["card_id"], "cmd": ctx["cmd"], "cwd": ctx["cwd"]}
-        )
-        require(isinstance(result, dict), "exec.start result is not an object")
+    def proc_run():
+        result = client.call("proc.start", {"cmd": ctx["cmd"], "cwd": ctx["cwd"]})
+        require(isinstance(result, dict), "proc.start result is not an object")
         run_id = result.get("run_id")
-        require(_is_id(run_id), "exec.start.run_id is not an int or string")
+        require(_is_id(run_id), "proc.start.run_id is not an int or string")
 
         def belongs(event):
-            if event.get("event") not in ("exec.output", "exec.exit"):
+            if event.get("event") not in ("proc.output", "proc.exit"):
                 return False
             return event.get("run_id", run_id) == run_id
 
@@ -1019,9 +1017,9 @@ def define_checks(h: Harness) -> list:
         stdout, stderr, finished, exit_code = bytearray(), bytearray(), False, None
         while not finished:
             remaining = deadline - time.monotonic()
-            require(remaining > 0, f"run {run_id} produced no exec.exit within {client.timeout:g}s")
-            event = client.wait_event(belongs, f"exec.output/exec.exit for run {run_id}", remaining)
-            if event["event"] == "exec.output":
+            require(remaining > 0, f"run {run_id} produced no proc.exit within {client.timeout:g}s")
+            event = client.wait_event(belongs, f"proc.output/proc.exit for run {run_id}", remaining)
+            if event["event"] == "proc.output":
                 channel = str(event.get("stream", event.get("channel", "stdout")))
                 data = event.get("data", event.get("text", ""))
                 (stderr if channel == "stderr" else stdout).extend(str(data).encode("utf-8", "replace"))
@@ -1039,6 +1037,89 @@ def define_checks(h: Harness) -> list:
             f"stdout {text[:200]!r} does not contain the expected output {ctx['expected']!r}",
         )
         return f"run {run_id} exit 0, stdout {text!r}"
+
+    def proc_duplex():
+        """Both directions of the channel, and the end of one of them.
+
+        `core/include/exec.h` used to hand every child the NUL device as its
+        standard input, so nothing could ever be *sent*.  A language server is
+        the case that forced the pipe: without a write path there are no
+        subsystems, only runners.
+        """
+        script = REPO_ROOT / "build" / "__e2e_duplex.py"
+        script.write_bytes(
+            b"import sys\n"
+            b"data = sys.stdin.read()\n"
+            b"sys.stdout.write('got:' + data.strip() + '\\n')\n"
+            b"sys.stdout.flush()\n"
+            b"sys.exit(7)\n"
+        )
+        try:
+            started = client.call("proc.start", {"cmd": f'"{sys.executable}" "{script}"'})
+            require(isinstance(started, dict), "proc.start result is not an object")
+            run_id = started.get("run_id")
+            require(_is_id(run_id), "proc.start.run_id is not an int or string")
+
+            written = client.call("proc.send", {"run_id": run_id, "data": "hello-channel\n"})
+            require(
+                isinstance(written, dict) and written.get("written") == len("hello-channel\n"),
+                f"proc.send wrote {written!r}; expected {len('hello-channel\n')} bytes",
+            )
+
+            listed = client.call("proc.list")
+            runs = listed.get("runs") if isinstance(listed, dict) else None
+            require(isinstance(runs, list), "proc.list did not return a `runs` array")
+            require(
+                any(run.get("run_id") == run_id for run in runs if isinstance(run, dict)),
+                f"run {run_id} is not in proc.list: {runs!r}",
+            )
+            require(
+                all("card_id" not in run for run in runs if isinstance(run, dict)),
+                f"proc.list still mentions a card: {runs!r}",
+            )
+
+            closed = client.call("proc.close", {"run_id": run_id})
+            require(
+                isinstance(closed, dict) and closed.get("closed") is True,
+                f"proc.close answered {closed!r}",
+            )
+            refused = client.expect_error(
+                "proc.send", {"run_id": run_id, "data": "too late\n"}
+            )
+            require(
+                str(refused.get("name", refused.get("code"))) == "PROC",
+                f"proc.send after proc.close was answered with {refused!r}, expected the PROC code",
+            )
+
+            def belongs(event):
+                return (
+                    event.get("event") in ("proc.output", "proc.exit")
+                    and event.get("run_id", run_id) == run_id
+                )
+
+            deadline = time.monotonic() + client.timeout
+            text, exit_code, finished = bytearray(), None, False
+            while not finished:
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, f"run {run_id} produced no proc.exit after proc.close")
+                event = client.wait_event(belongs, f"proc.output/proc.exit for run {run_id}", remaining)
+                if event["event"] == "proc.output":
+                    text.extend(str(event.get("data", "")).encode("utf-8", "replace"))
+                else:
+                    exit_code = event.get("code")
+                    finished = True
+            require(
+                exit_code == 7,
+                f"run {run_id} exited with {exit_code!r}, expected the script's 7",
+            )
+            require(
+                "got:hello-channel" in text.decode("utf-8", "replace"),
+                f"the child did not echo what proc.send wrote: {bytes(text)[:200]!r}",
+            )
+            return f"run {run_id} echoed {len(text)} byte(s) of stdin and exited 7"
+        finally:
+            if script.exists():
+                script.unlink()
 
     def lang_tokenize_sgml():
         """The SGML family has to survive the same path Brainfuck does.
@@ -1085,7 +1166,8 @@ def define_checks(h: Harness) -> list:
         ("file.read path containment", path_containment, None),
         ("view.save/view.load round-trip", board_roundtrip, None),
         ("starter board", starter_board, None),
-        ("exec.start run", exec_run, None),
+        ("proc.start run", proc_run, None),
+        ("proc duplex channel", proc_duplex, None),
     ]
 
 
@@ -1191,16 +1273,15 @@ def main(argv=None) -> int:
         "fixture_path": fixture["path"],
         "source_text": fixture["text"],
         "expected": expected,
-        "card_id": "e2e-editor",
         "cwd": str(REPO_ROOT),
-        "cmd": EXEC_TEMPLATE.format(python=sys.executable, bf=str(BF_PY), fixture=fixture["path"]),
+        "cmd": PROC_TEMPLATE.format(python=sys.executable, bf=str(BF_PY), fixture=fixture["path"]),
     }
 
     if not args.json:
         print(style.bold(f"seIDE e2e [{mode} mode]: {' '.join(argv_seide)}"))
         print(style.dim(f"fixture   : {fixture['path']}{' (created)' if fixture['created'] else ''}"))
         print(style.dim(f"expected  : {expected!r}"))
-        print(style.dim(f"exec cmd  : {ctx['cmd']}"))
+        print(style.dim(f"proc cmd  : {ctx['cmd']}"))
         if mode == "kernel":
             print(style.dim("note      : kernel mode skips lang.list / lang.tokenize"))
         print(style.dim("-" * 68))

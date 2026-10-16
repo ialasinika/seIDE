@@ -46,7 +46,7 @@ const WEB_DIR = path.join(SHELL_DIR, "web");
 const LANGS_DIR = path.join(ROOT, "langs");
 const SUBSYSTEMS_DIR = path.join(ROOT, "subsystems");
 
-const SHELL_VERSION = "0.3.0-alpha.1";
+const SHELL_VERSION = "0.4.0-alpha.1";
 const DEFAULT_KERNEL = process.platform === "win32"
   ? path.join(ROOT, "build", "seide.exe")
   : path.join(ROOT, "build", "seide");
@@ -534,6 +534,173 @@ export async function dispatch(frame, kernel, languages, subsystems = null) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* the child-process channel                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The seam between the subsystem host and the kernel's process layer.
+ *
+ * `SubsystemHost` wants a channel factory: something that turns
+ * `{command, cwd}` into `{write, onOutput, onExit, kill}`.  The kernel offers
+ * five methods and two notifications instead.  This class is that adapter --
+ * and deliberately nothing more.  It does not decide when to start a process
+ * (the host does), it does not parse what the process says (the subsystem
+ * does), and it holds no opinion about what may be launched (the descriptor
+ * does).  Replacing the kernel means replacing this file and nothing else.
+ *
+ * Output can arrive before the `proc.start` reply is read: the kernel writes
+ * the reply first, but Node hands the shell whole chunks, so both lines can
+ * land in the same read.  Events for a run nobody has claimed yet are parked
+ * here and replayed when the channel learns its `run_id`.  The parking lot is
+ * bounded, because a run nobody claims is one this shell has forgotten.
+ */
+class ProcChannels {
+  #kernel;
+  #byRun = new Map();
+  #parked = [];
+  #off;
+
+  constructor(kernel) {
+    this.#kernel = kernel;
+    this.#off = kernel.onNotification((event) => this.#onEvent(event));
+  }
+
+  #onEvent(event) {
+    const runId = event.run_id;
+    if (event.event === "proc.output") {
+      const channel = this.#byRun.get(runId);
+      if (channel !== undefined) {
+        channel.deliverOutput(event.data, event.stream);
+        return;
+      }
+      this.#parked.push(event);
+      if (this.#parked.length > 64) this.#parked.shift();
+      return;
+    }
+    if (event.event === "proc.exit") {
+      const channel = this.#byRun.get(runId);
+      if (channel === undefined) return;
+      this.#byRun.delete(runId);
+      channel.deliverExit(event.code);
+    }
+  }
+
+  /** The factory `SubsystemHost` is handed as `spawn`. */
+  open(spec) {
+    return new ProcChannel(this, this.#kernel, spec);
+  }
+
+  /** Called by a channel once `proc.start` has answered. */
+  claim(runId, channel) {
+    this.#byRun.set(runId, channel);
+    const stillParked = [];
+    for (const event of this.#parked) {
+      if (event.run_id === runId) channel.deliverOutput(event.data, event.stream);
+      else stillParked.push(event);
+    }
+    this.#parked = stillParked;
+  }
+
+  forget(runId) {
+    if (runId !== null && runId !== undefined) this.#byRun.delete(runId);
+  }
+
+  close() {
+    if (this.#off) this.#off();
+    this.#off = null;
+    this.#byRun.clear();
+    this.#parked = [];
+  }
+}
+
+/** One child process, seen from the shell as a duplex channel. */
+class ProcChannel {
+  #channels;
+  #kernel;
+  #runId = null;
+  #outputs = [];
+  #exits = [];
+  #exited = null;
+  #started;
+
+  constructor(channels, kernel, spec) {
+    this.#channels = channels;
+    this.#kernel = kernel;
+    const cwd = typeof spec.cwd === "string" && spec.cwd !== "" ? spec.cwd : ".";
+    // `spec.env` is deliberately not passed on: the kernel starts a process,
+    // it does not invent an environment for one.  A subsystem that needs a
+    // variable says so in its own command line.
+    this.#started = kernel.call("proc.start", { cmd: spec.command, cwd })
+      .then((result) => {
+        this.#runId = result.run_id;
+        this.#channels.claim(this.#runId, this);
+        return this.#runId;
+      })
+      .catch((err) => {
+        this.#channels.forget(this.#runId);
+        throw err;
+      });
+    // A caller that writes before awaiting must not take the whole shell down
+    // with an unhandled rejection; whoever awaits `write` still sees it.
+    this.#started.catch(() => {});
+  }
+
+  get runId() {
+    return this.#runId;
+  }
+
+  /** The host's name for "output arrived". */
+  deliverOutput(data, stream) {
+    for (const cb of this.#outputs) {
+      try {
+        cb(data, stream);
+      } catch {
+        // One subsystem's listener must not stop the others.
+      }
+    }
+  }
+
+  /** The host's name for "the process ended". */
+  deliverExit(code) {
+    this.#exited = code;
+    for (const cb of this.#exits) {
+      try {
+        cb(code);
+      } catch {
+        // as above
+      }
+    }
+  }
+
+  write(text) {
+    return this.#started.then(() => this.#kernel.call("proc.send", {
+      run_id: this.#runId,
+      data: String(text),
+    }));
+  }
+
+  /** Says "no more input" without killing the process. */
+  closeInput() {
+    return this.#started.then(() => this.#kernel.call("proc.close", { run_id: this.#runId }));
+  }
+
+  kill() {
+    return this.#started
+      .then(() => this.#kernel.call("proc.stop", { run_id: this.#runId }))
+      .catch(() => {});
+  }
+
+  onOutput(cb) {
+    if (typeof cb === "function") this.#outputs.push(cb);
+  }
+  onExit(cb) {
+    if (typeof cb !== "function") return;
+    this.#exits.push(cb);
+    if (this.#exited !== null) cb(this.#exited);
+  }
+}
+
 function parseFrame(text) {
   try {
     return { frame: JSON.parse(text) };
@@ -557,14 +724,16 @@ async function runRpc(options) {
   const languages = await loadLanguages(LANGS_DIR, (message) => {
     process.stderr.write(`[shell] ${message}\n`);
   });
+  await kernel.start();
+  const procs = new ProcChannels(kernel);
   const subsystems = new SubsystemHost({
     descriptors: loadSubsystems(SUBSYSTEMS_DIR, (message) => {
       process.stderr.write(`[shell] ${message}\n`);
     }),
     onEvent: (event) => writeStdout(event),
+    spawn: (spec) => procs.open(spec),
+    root: path.resolve(options.workspace),
   });
-
-  await kernel.start();
   if (options.verbose) {
     process.stderr.write(`[shell] rpc on ${kernel.exe} (workspace ${kernel.workspace})\n`);
   }
@@ -591,8 +760,15 @@ async function runRpc(options) {
     }
   } finally {
     // Whatever ends the loop -- EOF, an error, a signal -- the kernel child
-    // goes with it, and so does anything a subsystem started.
-    void subsystems.stopAll().catch(() => {});
+    // goes with it, and so does anything a subsystem started.  The stop is
+    // awaited so the `proc.stop` calls reach the kernel before it is closed;
+    // closing the channel router first would drop their exits on the floor.
+    try {
+      await subsystems.stopAll();
+    } catch {
+      // Nothing to do about it: the kernel is about to go away regardless.
+    }
+    procs.close();
     kernel.close();
   }
 
@@ -728,11 +904,15 @@ async function runServe(options) {
 
   kernel.onNotification(broadcast);
 
+  const procs = new ProcChannels(kernel);
+
   const subsystems = new SubsystemHost({
     descriptors: loadSubsystems(SUBSYSTEMS_DIR, (message) => {
       process.stderr.write(`[shell] ${message}\n`);
     }),
     onEvent: broadcast,
+    spawn: (spec) => procs.open(spec),
+    root: path.resolve(options.workspace),
   });
 
   const server = createServer((req, res) => {
@@ -865,9 +1045,11 @@ async function runServe(options) {
         /* ignore */
       }
     }
-    // A subsystem that is still starting gets one turn to stop; the process is
-    // about to end either way.
+    // A subsystem that is still starting gets one turn to stop; the shell is
+    // about to end either way, so the channel router closes with it and the
+    // exits still in flight are nobody's business any more.
     void subsystems.stopAll().catch(() => {});
+    procs.close();
     for (const res of subscribers) {
       try {
         res.end();

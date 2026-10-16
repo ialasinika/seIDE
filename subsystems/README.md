@@ -128,11 +128,55 @@ That is the one seam this layer deliberately leaves open.  A builtin needs no
 process at all, and `words` — the subsystem that works on any file — is a
 builtin on purpose: it is the fallback that exists when no server does.
 
-Wiring the factory to the kernel's duplex child-process channel (`proc.*`, issue
-tracked as the "A/B" decision in the goal notes) changes nothing above this
-line: same descriptors, same four methods, same states.  Until then a `process`
-subsystem fails fast with `SUBSYSTEM_UNSUPPORTED` and says why, rather than
-pretending to run.
+The shell wires that factory to the kernel's duplex child-process channel:
+
+```js
+const procs = new ProcChannels(kernel);            // shell/main.mjs
+const host = new SubsystemHost({
+  descriptors: loadSubsystems(SUBSYSTEMS_DIR),
+  spawn: (spec) => procs.open(spec),               // proc.start/send/close/stop
+  root: path.resolve(options.workspace),
+});
+```
+
+A channel is `proc.start` for the process, `proc.send` for `write`, `proc.close`
+for the end of its input, `proc.stop` for `kill`, and the `proc.output` /
+`proc.exit` notifications for the two callbacks.  A host constructed without
+`spawn` still loads, lists and starts builtins; a `process` subsystem then fails
+fast with `SUBSYSTEM_UNSUPPORTED` and says why, rather than pretending to run.
+
+## The process subsystem: `lsp`
+
+`lsp.sub` declares a real language server and `lsp.mjs` speaks LSP to it:
+`Content-Length` framing, `initialize`, `didOpen`/`didChange`/`didClose`,
+`completion`, `hover`, `definition`, `formatting`, pushed diagnostics, and a
+restart-safe failure path.
+
+```
+status      {}                                  -> {"server", "capabilities", "open", "diagnostics", "stderr"}
+complete    {"path", "text", "offset"?, "limit"?} -> {"items", "total", "isIncomplete"}
+hover       {"path", "text", "offset"}           -> {"contents", "range"}
+definition  {"path", "text", "offset"}           -> {"locations":[{"path","line","column","range"}]}
+diagnose    {"path", "text"?, "wait"?}           -> {"diagnostics", "stale", "version"}
+format      {"path", "text", "options"?}         -> {"edits", "total"}
+```
+
+The method names are the client's, not LSP's: a client asks any subsystem for a
+capability by the same two names `words` answers (`complete`, `diagnose`), and
+the LSP protocol names appear only in the calls this adapter makes to the
+server.
+
+Every request carries the buffer the client is looking at, so the server can
+never answer from a stale document.  `lsp.sub` ships pointed at
+`lsp-stub.mjs` — a scripted server that needs no toolchain — and pointing it at
+a real one is one line:
+
+```
+launch node "{here}/lsp-stub.mjs"      # or: launch rust-analyzer
+```
+
+`{here}` is the directory `lsp.mjs` lives in, so a descriptor can name its own
+script and still work from any workspace.
 
 ## The built-in: `words`
 
@@ -162,8 +206,11 @@ bracket — and when it has been deleted the same rules run on raw text.
 node subsystems/selftest.mjs
 ```
 
-97 checks covering the descriptor grammar and its rejections, directory
+111 checks covering the descriptor grammar and its rejections, directory
 loading, the whole lifecycle (states, autostart, shared starts, failures,
 timeouts, stop-all), the channel seam, `words` completion and diagnostics
-(including the tokenizer's quieting), and the host's independence from the
-kernel.  It needs no kernel, no shell, no browser and no network.
+(including the tokenizer's quieting), the `lsp` adapter's framing helpers, the
+same adapter against a **real child** running `lsp-stub.mjs` (a full
+initialize → didOpen → completion/hover/definition/format → pushed diagnostics
+→ exit run), and the host's independence from the kernel.  It needs no kernel,
+no shell, no browser and no network.

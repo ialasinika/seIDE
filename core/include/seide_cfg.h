@@ -40,14 +40,14 @@
 #endif
 
 /* The kernel's own version, reported by `hello` and `seide version`. */
-#define SDE_VERSION "0.3.0-alpha.1"
-#define SDE_PROTOCOL "seide/2"
+#define SDE_VERSION "0.4.0-alpha.1"
+#define SDE_PROTOCOL "seide/3"
 /* The same version as a number, which is what machines compare. */
-#define SDE_PROTOCOL_VERSION 2
+#define SDE_PROTOCOL_VERSION 3
 
 /* Compile-time switches a fork flips to cut whole subsystems out. */
-#ifndef SDE_WITH_EXEC
-#  define SDE_WITH_EXEC 1
+#ifndef SDE_WITH_PROC
+#  define SDE_WITH_PROC 1
 #endif
 #ifndef SDE_WITH_VIEW
 #  define SDE_WITH_VIEW 1

@@ -23,17 +23,17 @@ what a trimmed kernel still does.
 > in the Makefile and the method table in rpc.c, is the complete list of places a
 > fork touches to remove a subsystem.
 
-So removing a module is four edits. Using `exec` as the worked example:
+So removing a module is four edits. Using `proc` as the worked example:
 
 **1. The file under `core/`.**
 
 ```sh
-git rm core/src/exec.c
+git rm core/src/proc.c
 ```
 
 If it is one of the platform modules, the file lives under `core/port/` instead
 (`sys_win32.c`, `proc_win32.c`). If the module is referenced by a header, remove
-the header too (`core/include/exec.h`) and every `#include` of it.
+the header too (`core/include/proc.h`) and every `#include` of it.
 
 **2. The `SRC` line in `Makefile`.**
 
@@ -44,7 +44,7 @@ SRC = \
 	core/src/json.c \
 	core/src/wksp.c \
 	core/src/view.c \
-	core/src/exec.c \      <-- delete this line
+	core/src/proc.c \      <-- delete this line
 	core/src/rpc.c \
 	core/src/serve.c \
 	core/src/app.c \
@@ -64,13 +64,15 @@ as long as the terminator survives.
 
 **4. Any method in `core/src/rpc.c` that calls it.**
 
-For `exec` that is the `#if SDE_WITH_EXEC` block and its three table rows:
+For `proc` that is the `#if SDE_WITH_PROC` block and its five table rows:
 
 ```c
-#if SDE_WITH_EXEC
-    { "exec.start",     h_exec_start },
-    { "exec.stop",      h_exec_stop },
-    { "exec.list",      h_exec_list },
+#if SDE_WITH_PROC
+    { "proc.start",     h_proc_start },
+    { "proc.send",      h_proc_send },
+    { "proc.close",     h_proc_close },
+    { "proc.stop",      h_proc_stop },
+    { "proc.list",      h_proc_list },
 #endif
 ```
 
@@ -80,36 +82,37 @@ supports: instead of deleting the methods, flip the switch in
 
 ```c
 /* Compile-time switches a fork flips to cut whole subsystems out. */
-#ifndef SDE_WITH_EXEC
-#define SDE_WITH_EXEC 1
+#ifndef SDE_WITH_PROC
+#define SDE_WITH_PROC 1
 #endif
 #ifndef SDE_WITH_VIEW
 #define SDE_WITH_VIEW 1
 #endif
 ```
 
-Setting `SDE_WITH_EXEC 0` removes `exec.start`, `exec.stop` and `exec.list` from
-the table at compile time and lets the linker drop the handlers — but you must
-*still* delete the `SRC` line and the file, because otherwise `exec.c` is
-compiled into the binary with no caller. The switch is what makes the
-`rpc.c` edit mechanical; the `SRC` edit is what makes the binary smaller.
+Setting `SDE_WITH_PROC 0` removes `proc.start`, `proc.send`, `proc.close`,
+`proc.stop` and `proc.list` from the table at compile time and lets the linker
+drop the handlers — but you must *still* delete the `SRC` line and the file,
+because otherwise `proc.c` is compiled into the binary with no caller. The
+switch is what makes the `rpc.c` edit mechanical; the `SRC` edit is what makes
+the binary smaller.
 
 Two subsystems also touch other modules' initialisation. `wksp` and `view` are
-constructed in `core/src/app.c`; `exec` is created and bound there too:
+constructed in `core/src/app.c`; `proc` is created and bound there too:
 
 ```c
-app->execs = sde_execset_new();
+app->procs = sde_procset_new();
 ...
-/* Lets the exec pump thread publish notifications through app->emit. */
-sde_exec_bind(app->execs, app);
+/* Lets the proc pump thread publish notifications through app->emit. */
+sde_procset_bind(app->procs, app);
 ```
 
-If you delete `exec`, delete that block from `app.c` as part of edit 1 — the
+If you delete `proc`, delete that block from `app.c` as part of edit 1 — the
 "four places" is the minimum, not a guarantee that no file outside `core/src/`
 names the module. Grep is the honest answer:
 
 ```sh
-grep -rn "sde_exec" core/
+grep -rn "sde_proc" core/
 ```
 
 ---
@@ -119,7 +122,7 @@ grep -rn "sde_exec" core/
 `seide modules` on this build prints exactly this:
 
 ```text
-seIDE kernel 0.2.1-alpha.3 -- 10 source modules
+seIDE kernel 0.3.0-alpha.1 -- 10 source modules
 To drop one: delete its line in the Makefile SRC list, its file
 under core/, and any method in rpc.c that calls it.
 
@@ -147,9 +150,9 @@ view     [optional]
          the client's view document: opaque JSON, atomic persistence, revisions
          cut it and: no document survives a restart; the client is left with what it holds
 
-exec     [optional]
-         child processes for `runner` cards, with streamed output
-         cut it and: cards can no longer run anything
+proc     [optional]
+         child processes with a duplex channel, streamed to the client
+         cut it and: nothing can start a process; runners and process subsystems stop
 
 serve    [optional]
          newline-delimited JSON-RPC over stdin/stdout
@@ -177,13 +180,13 @@ are whole subsystems.
 | `port` | required | the platform boundary: files, paths, threads, processes | nothing builds; this is the layer a fork replaces to leave Win32 |
 | `wksp` | optional | workspace reads/writes, path containment, content revisions | files can no longer be opened or saved; only the canvas remains |
 | `view` | optional | the client's view document: opaque JSON, atomic persistence, revisions | no document survives a restart; the client is left with what it holds |
-| `exec` | optional | child processes for `runner` cards, with streamed output | cards can no longer run anything |
+| `proc` | optional | child processes with a duplex channel, streamed to the client | nothing can start a process; runners and process subsystems stop |
 | `serve` | optional | newline-delimited JSON-RPC over stdin/stdout | the kernel has no way in; useful only as a linkable library |
 | `rpc` | required | the method table that turns frames into actions | nothing is callable; keep it and the kernel has no verbs |
 | `app` | required | constructs and owns the shared state modules are handed | nothing builds |
 
 Six required (`buf`, `vec`, `json`, `port`, `rpc`, `app`), four optional
-(`wksp`, `view`, `exec`, `serve`).
+(`wksp`, `view`, `proc`, `serve`).
 
 ---
 
@@ -191,20 +194,24 @@ Six required (`buf`, `vec`, `json`, `port`, `rpc`, `app`), four optional
 
 The manifest is one line per module; this is the detail behind it.
 
-### Cutting `exec` — no processes
+### Cutting `proc` — no processes
 
-Delete `core/src/exec.c`, `core/include/exec.h`, its `SRC` line, its table entry,
-the `#if SDE_WITH_EXEC` block in `rpc.c`, and the `sde_execset_new` /
-`sde_exec_bind` calls in `core/src/app.c` (and the `execs` field of
-`sde_app`). `SDE_WITH_EXEC` becomes vestigial; delete it too.
+Delete `core/src/proc.c`, `core/include/proc.h`, its `SRC` line, its table entry,
+the `#if SDE_WITH_PROC` block in `rpc.c`, and the `sde_procset_new` /
+`sde_procset_bind` calls in `core/src/app.c` (and the `procs` field of
+`sde_app`). `SDE_WITH_PROC` becomes vestigial; delete it too.
 
-- Protocol loses `exec.start`, `exec.stop`, `exec.list`, and the `exec.output` /
-  `exec.exit` notifications.
+- Protocol loses `proc.start`, `proc.send`, `proc.close`, `proc.stop`,
+  `proc.list`, and the `proc.output` / `proc.exit` notifications.
 - The `runner` card in the shell has nothing to call: `cards.mjs`'s runner
   renderer becomes a dead button. Trim the kind from `CARD_KINDS` in
   `shell/web/board.mjs` and delete the runner's `registerCardKind` call at the
   end of `shell/web/cards.mjs` — the registry is the only place a kind exists.
-- **Survives:** files, the board, the whole editor, the whole language layer.
+- `subsystems/lsp.sub` is a `kind process` descriptor: `subsystem.list` still
+  shows it, and starting it answers `SUBSYSTEM_UNSUPPORTED` with the reason. The
+  `words` builtin needs nothing from `proc`.
+- **Survives:** files, the board, the whole editor, the whole language layer, and
+  every builtin subsystem.
 - **Shell must change too:** yes, or the runner card is a control that fails.
 
 ### Cutting `view` — a canvas that does not persist
@@ -243,8 +250,8 @@ and the `workspace.info` / `workspace.list` / `file.read` / `file.write` /
   it: the watcher notices the first `-32601 METHOD_NOT_FOUND` and stops asking.
   Cutting *only* `file.stat` — one handler plus one table row — is possible without
   touching the module at all; `docs/FORK.md` describes that smaller cut.
-- `exec.start`'s `cwd` resolution goes through `sde_wksp_resolve`, so `exec`
-  depends on `wksp`; cutting `wksp` means changing `exec.start` too (either
+- `proc.start`'s `cwd` resolution goes through `sde_wksp_resolve`, so `proc`
+  depends on `wksp`; cutting `wksp` means changing `proc.start` too (either
   refusing a relative `cwd` or resolving it against the process's own directory).
 - **Survives:** the board, links, notes, and the whole layout mechanism.
 - **Shell must change too:** yes — the `editor`, `search`, `files` and `project`

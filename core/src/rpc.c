@@ -13,9 +13,9 @@
 #include <string.h>
 
 #include "app.h"
-#include "exec.h"
 #include "json.h"
 #include "port.h"
+#include "proc.h"
 #include "rpc.h"
 #include "view.h"
 #include "wksp.h"
@@ -488,15 +488,14 @@ static void h_view_save(sde_call *c)
 #endif /* SDE_WITH_VIEW */
 
 /* ---------------------------------------------------------------------- */
-/* handlers: running commands                                             */
+/* handlers: child processes                                              */
 /* ---------------------------------------------------------------------- */
 
-#if SDE_WITH_EXEC
+#if SDE_WITH_PROC
 
-static void h_exec_start(sde_call *c)
+static void h_proc_start(sde_call *c)
 {
     char        err[256];
-    const char *card_id = sde_json_gets(c->params, "card_id", "");
     const char *cmd = NULL;
     const char *cwd = sde_json_gets(c->params, "cwd", NULL);
     char       *abs_cwd = NULL;
@@ -520,11 +519,10 @@ static void h_exec_start(sde_call *c)
     }
 
     err[0] = '\0';
-    run_id = sde_exec_start(c->app->execs, card_id, cmd, abs_cwd,
-                            err, sizeof(err));
+    run_id = sde_procset_start(c->app->procs, cmd, abs_cwd, err, sizeof(err));
     free(abs_cwd);
     if (run_id < 0) {
-        fail(c, SDE_RPC_EXEC, "EXEC", err[0] ? err : "cannot start process");
+        fail(c, SDE_RPC_PROC, "PROC", err[0] ? err : "cannot start process");
         return;
     }
 
@@ -537,19 +535,96 @@ static void h_exec_start(sde_call *c)
     c->owned = r;
 }
 
-static void h_exec_stop(sde_call *c)
+/*
+ * The three calls that name one run share this check.  Returns 0 and fills
+ * `*run_id` in, or answers the call with an error and returns -1.
+ */
+static int want_run(sde_call *c, long *run_id)
 {
     const sde_json *idv = sde_json_get(c->params, "run_id");
-    long            run_id;
-    sde_json       *r;
 
     if (idv == NULL || idv->type != SDE_JSON_NUM) {
         fail(c, SDE_RPC_INVALID_PARAMS, "INVALID_PARAMS",
              "`run_id` must be a number");
+        return -1;
+    }
+    *run_id = sde_json_as_int(idv, -1);
+    return 0;
+}
+
+/*
+ * Writes to a child's stdin.  The bytes are queued by the port layer and go
+ * out on a writer thread of its own, so this answers immediately even when
+ * the child has stopped reading; a queue that is already full is an error,
+ * which is what keeps a chatty client from growing the kernel's memory.
+ */
+static void h_proc_send(sde_call *c)
+{
+    const char *data = NULL;
+    long        run_id = 0;
+    char        err[256];
+    sde_json   *r;
+
+    if (want_run(c, &run_id) != 0) {
         return;
     }
-    run_id = sde_json_as_int(idv, -1);
-    if (sde_exec_stop(c->app->execs, run_id) != 0) {
+    need_string(c, "data", &data);
+    if (c->code != 0) {
+        return;
+    }
+
+    err[0] = '\0';
+    if (sde_procset_send(c->app->procs, run_id, data, strlen(data),
+                         err, sizeof(err)) != 0) {
+        fail(c, SDE_RPC_PROC, "PROC",
+             err[0] ? err : "cannot write to that process");
+        return;
+    }
+
+    r = sde_json_obj();
+    if (r == NULL) {
+        fail(c, SDE_RPC_INTERNAL, "INTERNAL", "out of memory");
+        return;
+    }
+    sde_json_set(r, "written", sde_json_int((long) strlen(data)));
+    c->owned = r;
+}
+
+/*
+ * Closes a child's stdin after everything already queued has gone out.  A
+ * client that speaks a framed protocol uses this to say "no more requests";
+ * the process then finishes on its own and `proc.exit` retires it.
+ */
+static void h_proc_close(sde_call *c)
+{
+    long      run_id = 0;
+    sde_json *r;
+
+    if (want_run(c, &run_id) != 0) {
+        return;
+    }
+    if (sde_procset_close_input(c->app->procs, run_id) != 0) {
+        fail(c, SDE_RPC_NOT_FOUND, "NOT_FOUND", "no such run");
+        return;
+    }
+    r = sde_json_obj();
+    if (r == NULL) {
+        fail(c, SDE_RPC_INTERNAL, "INTERNAL", "out of memory");
+        return;
+    }
+    sde_json_set(r, "closed", sde_json_bool(1));
+    c->owned = r;
+}
+
+static void h_proc_stop(sde_call *c)
+{
+    long      run_id = 0;
+    sde_json *r;
+
+    if (want_run(c, &run_id) != 0) {
+        return;
+    }
+    if (sde_procset_stop(c->app->procs, run_id) != 0) {
         fail(c, SDE_RPC_NOT_FOUND, "NOT_FOUND", "no such run");
         return;
     }
@@ -562,9 +637,9 @@ static void h_exec_stop(sde_call *c)
     c->owned = r;
 }
 
-static void h_exec_list(sde_call *c)
+static void h_proc_list(sde_call *c)
 {
-    sde_json *r = sde_exec_list(c->app->execs);
+    sde_json *r = sde_procset_list(c->app->procs);
 
     if (r == NULL) {
         fail(c, SDE_RPC_INTERNAL, "INTERNAL", "out of memory");
@@ -573,7 +648,7 @@ static void h_exec_list(sde_call *c)
     c->owned = r;
 }
 
-#endif /* SDE_WITH_EXEC */
+#endif /* SDE_WITH_PROC */
 
 /* ---------------------------------------------------------------------- */
 /* the table                                                              */
@@ -590,10 +665,12 @@ static const sde_method sde_methods[] = {
     { "view.load",      h_view_load },
     { "view.save",      h_view_save },
 #endif
-#if SDE_WITH_EXEC
-    { "exec.start",     h_exec_start },
-    { "exec.stop",      h_exec_stop },
-    { "exec.list",      h_exec_list },
+#if SDE_WITH_PROC
+    { "proc.start",     h_proc_start },
+    { "proc.send",      h_proc_send },
+    { "proc.close",     h_proc_close },
+    { "proc.stop",      h_proc_stop },
+    { "proc.list",      h_proc_list },
 #endif
     { NULL, NULL }
 };

@@ -585,6 +585,54 @@ body.is-classic #board:active { cursor: default; }
 .ed-hit { background: #6fb3ff33; color: inherit; border-radius: 2px; }
 .ed-hit.is-current { background: #ffb86b55; box-shadow: 0 0 0 1px #ffb86b66; }
 
+/* Completions dock under the editor instead of floating over it. A <textarea>
+   has no selection rectangle to position a popup against, and reading one would
+   mean a mirror copy of the text that can drift from the real thing. The rows
+   are the same information, always in the same place, keyboard first. */
+.ed-complete {
+  flex: 0 0 auto;
+  max-height: 132px;
+  overflow-y: auto;
+  border-top: 1px solid var(--line-soft);
+  background: #1a1d22;
+  font: 10.5px/1.45 var(--mono-font);
+}
+.ed-complete[hidden] { display: none; }
+.ed-complete-row {
+  padding: 1px 7px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.ed-complete-row.on { background: #2a3038; color: var(--accent); }
+
+/* The issue strip: one row per diagnostic, painted under the editor. A wrong
+   line number in a gutter is easy to misread; a row that says what is wrong is
+   not. Clicking one puts the caret on the text it names. */
+.ed-issues {
+  flex: 0 0 auto;
+  max-height: 84px;
+  overflow-y: auto;
+  border-top: 1px solid var(--line-soft);
+  background: #1a1d22;
+  font: 10.5px/1.45 var(--mono-font);
+}
+.ed-issues[hidden] { display: none; }
+.ed-issue {
+  padding: 1px 7px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.ed-issue:hover { background: #2a3038; }
+.ed-issue.sev-error { color: #ff8f8f; }
+.ed-issue.sev-warning { color: #ffc46b; }
+.ed-issue.sev-info { color: #8fbcff; }
+.ed-issue.sev-hint { color: var(--fg-faint); }
+
 /* ------------------------------------------------------------------ */
 /* runner card                                                         */
 /* ------------------------------------------------------------------ */

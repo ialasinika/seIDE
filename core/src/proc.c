@@ -1,12 +1,14 @@
 /*
- * exec.c - child process bookkeeping and the notification pump.
+ * proc.c - child process bookkeeping, the duplex channel and the pump.
  *
  * One pump thread serves every run.  It polls each live process with the
  * non-blocking sde_proc_read() offered by the port layer and turns what it
  * finds into notifications.  Polling (15 ms) rather than blocking readers
  * keeps the kernel single-writer: nothing but this thread and the RPC loop
  * writes to stdout, and both go through the same emit callback, which the
- * shell layer serialises behind one mutex.
+ * shell layer serialises behind one mutex.  Input travels the other way on
+ * the port layer's writer thread, so a call that sends bytes to a child that
+ * has stopped reading cannot stall the RPC loop.
  */
 #include "seide_cfg.h"
 
@@ -15,17 +17,16 @@
 #include <string.h>
 
 #include "app.h"
-#include "exec.h"
+#include "proc.h"
 #include "json.h"
 #include "port.h"
 
-#define SDE_EXEC_MAX_RUNS    64
-#define SDE_EXEC_IDLE_MS     15
-#define SDE_EXEC_READ_MAX    8192
+#define SDE_PROC_MAX_RUNS    64
+#define SDE_PROC_IDLE_MS     15
+#define SDE_PROC_READ_MAX    8192
 
 typedef struct sde_run {
     long          id;
-    char         *card_id;
     char         *cmd;
     char         *cwd;
     sde_proc     *proc;
@@ -34,7 +35,7 @@ typedef struct sde_run {
     unsigned long started;
 } sde_run;
 
-struct sde_execset {
+struct sde_procset {
     sde_run    *runs;
     size_t      count;
     size_t      cap;
@@ -73,11 +74,11 @@ static sde_json *notification(const char *event, long run_id)
  * Drops the oldest finished runs so a long session cannot grow without
  * bound.  Called with `lock` held and at least one free slot available.
  */
-static void prune_locked(sde_execset *s)
+static void prune_locked(sde_procset *s)
 {
     size_t i;
 
-    while (s->count >= SDE_EXEC_MAX_RUNS) {
+    while (s->count >= SDE_PROC_MAX_RUNS) {
         size_t victim = s->count; /* none found yet */
 
         for (i = 0; i < s->count; i++) {
@@ -90,7 +91,6 @@ static void prune_locked(sde_execset *s)
             break; /* every run is still alive; let the table grow instead */
         }
         sde_proc_free(s->runs[victim].proc);
-        free(s->runs[victim].card_id);
         free(s->runs[victim].cmd);
         free(s->runs[victim].cwd);
         memmove(&s->runs[victim], &s->runs[victim + 1],
@@ -103,9 +103,9 @@ static void prune_locked(sde_execset *s)
 /* lifecycle                                                              */
 /* ---------------------------------------------------------------------- */
 
-sde_execset *sde_execset_new(void)
+sde_procset *sde_procset_new(void)
 {
-    sde_execset *s = (sde_execset *) malloc(sizeof(sde_execset));
+    sde_procset *s = (sde_procset *) malloc(sizeof(sde_procset));
 
     if (s == NULL) {
         return NULL;
@@ -126,7 +126,7 @@ sde_execset *sde_execset_new(void)
     return s;
 }
 
-void sde_exec_bind(sde_execset *s, sde_app *app)
+void sde_procset_bind(sde_procset *s, sde_app *app)
 {
     if (s != NULL) {
         s->app = app;
@@ -135,16 +135,16 @@ void sde_exec_bind(sde_execset *s, sde_app *app)
 
 static void pump_main(void *ud)
 {
-    sde_execset *s = (sde_execset *) ud;
+    sde_procset *s = (sde_procset *) ud;
 
     while (!s->pump_stop) {
-        if (sde_exec_pump(s) == 0) {
-            sde_port_sleep_ms(SDE_EXEC_IDLE_MS);
+        if (sde_procset_pump(s) == 0) {
+            sde_port_sleep_ms(SDE_PROC_IDLE_MS);
         }
     }
 }
 
-static void ensure_pump(sde_execset *s)
+static void ensure_pump(sde_procset *s)
 {
     if (s->pump_started) {
         return;
@@ -154,7 +154,7 @@ static void ensure_pump(sde_execset *s)
     s->pump = sde_thread_start(pump_main, s);
 }
 
-void sde_execset_free(sde_execset *s)
+void sde_procset_free(sde_procset *s)
 {
     size_t i;
 
@@ -172,7 +172,6 @@ void sde_execset_free(sde_execset *s)
             sde_proc_kill(s->runs[i].proc);
         }
         sde_proc_free(s->runs[i].proc);
-        free(s->runs[i].card_id);
         free(s->runs[i].cmd);
         free(s->runs[i].cwd);
     }
@@ -185,14 +184,14 @@ void sde_execset_free(sde_execset *s)
 /* starting and stopping                                                  */
 /* ---------------------------------------------------------------------- */
 
-long sde_exec_start(sde_execset *s, const char *card_id, const char *cmd,
-                    const char *cwd, char *err, size_t errcap)
+long sde_procset_start(sde_procset *s, const char *cmd, const char *cwd,
+                       char *err, size_t errcap)
 {
     sde_proc *proc;
     long      id;
 
     if (s == NULL || cmd == NULL || cmd[0] == '\0') {
-        set_err(err, errcap, "exec.start needs a non-empty `cmd`");
+        set_err(err, errcap, "proc.start needs a non-empty `cmd`");
         return -1;
     }
 
@@ -223,7 +222,6 @@ long sde_exec_start(sde_execset *s, const char *card_id, const char *cmd,
 
     id = s->next_id++;
     s->runs[s->count].id = id;
-    s->runs[s->count].card_id = sde_port_strdup(card_id == NULL ? "" : card_id);
     s->runs[s->count].cmd = sde_port_strdup(cmd);
     s->runs[s->count].cwd = sde_port_strdup(cwd == NULL ? "" : cwd);
     s->runs[s->count].proc = proc;
@@ -237,7 +235,7 @@ long sde_exec_start(sde_execset *s, const char *card_id, const char *cmd,
     return id;
 }
 
-int sde_exec_stop(sde_execset *s, long run_id)
+int sde_procset_stop(sde_procset *s, long run_id)
 {
     size_t i;
     int    found = 0;
@@ -263,14 +261,14 @@ int sde_exec_stop(sde_execset *s, long run_id)
 
     if (stopped) {
         /*
-         * `exec.exit` is the only event that retires a run, and the pump skips
+         * `proc.exit` is the only event that retires a run, and the pump skips
          * runs that are no longer running, so a stopped run would otherwise
-         * stay on screen forever.  The code matches what `exec.list` reports
+         * stay on screen forever.  The code matches what `proc.list` reports
          * for the same run (-1, "stopped rather than exited").  Whatever the
          * child had left in its pipe is discarded: the user asked for it to
          * die, not to finish.
          */
-        sde_json *notif = notification("exec.exit", run_id);
+        sde_json *notif = notification("proc.exit", run_id);
 
         if (notif != NULL) {
             sde_json_set(notif, "code", sde_json_int(-1));
@@ -280,7 +278,58 @@ int sde_exec_stop(sde_execset *s, long run_id)
     return found ? 0 : -1;
 }
 
-int sde_exec_live_count(const sde_execset *s)
+/*
+ * Looks a run up and hands it the port layer's process.  Called with no lock
+ * held; the caller owns whatever it does with the process next.  A run that
+ * has already exited has no input left to write to, which is an error.
+ */
+static sde_proc *lookup_live(sde_procset *s, long run_id)
+{
+    size_t     i;
+    sde_proc  *proc = NULL;
+
+    if (s == NULL) {
+        return NULL;
+    }
+    sde_mutex_lock(s->lock);
+    for (i = 0; i < s->count; i++) {
+        if (s->runs[i].id == run_id && s->runs[i].running) {
+            proc = s->runs[i].proc;
+            break;
+        }
+    }
+    sde_mutex_unlock(s->lock);
+    return proc;
+}
+
+int sde_procset_send(sde_procset *s, long run_id, const char *data, size_t len,
+                     char *err, size_t errcap)
+{
+    sde_proc *proc = lookup_live(s, run_id);
+
+    if (proc == NULL) {
+        set_err(err, errcap, "no such running process");
+        return -1;
+    }
+    /*
+     * The port layer queues the bytes and returns; it never calls WriteFile
+     * from this thread.  Holding no lock here matters: a child that stopped
+     * reading must not be able to block the RPC loop, and it cannot.
+     */
+    return sde_proc_write(proc, data, len, err, errcap);
+}
+
+int sde_procset_close_input(sde_procset *s, long run_id)
+{
+    sde_proc *proc = lookup_live(s, run_id);
+
+    if (proc == NULL) {
+        return -1;
+    }
+    return sde_proc_close_input(proc);
+}
+
+int sde_procset_live_count(const sde_procset *s)
 {
     size_t i;
     int    n = 0;
@@ -298,7 +347,7 @@ int sde_exec_live_count(const sde_execset *s)
     return n;
 }
 
-sde_json *sde_exec_list(const sde_execset *s)
+sde_json *sde_procset_list(const sde_procset *s)
 {
     sde_json *out = sde_json_obj();
     sde_json *arr = sde_json_arr();
@@ -318,7 +367,6 @@ sde_json *sde_exec_list(const sde_execset *s)
             continue;
         }
         sde_json_set(r, "run_id", sde_json_int(s->runs[i].id));
-        sde_json_set(r, "card_id", sde_json_str(s->runs[i].card_id));
         sde_json_set(r, "cmd", sde_json_str(s->runs[i].cmd));
         sde_json_set(r, "running", sde_json_bool(s->runs[i].running));
         sde_json_set(r, "code", sde_json_int(s->runs[i].code));
@@ -416,7 +464,7 @@ static void append_safe(sde_buf *out, const char *data, size_t len)
     }
 }
 
-static int pump_one(sde_execset *s, size_t i)
+static int pump_one(sde_procset *s, size_t i)
 {
     sde_buf   out;
     int       stream = 0;
@@ -433,7 +481,7 @@ static int pump_one(sde_execset *s, size_t i)
     }
     run_id = s->runs[i].id;
     sde_buf_init(&out);
-    n = sde_proc_read(s->runs[i].proc, &stream, &out, SDE_EXEC_READ_MAX);
+    n = sde_proc_read(s->runs[i].proc, &stream, &out, SDE_PROC_READ_MAX);
     if (n < 0) {
         exited = 1;
         code = sde_proc_exit_code(s->runs[i].proc);
@@ -443,7 +491,7 @@ static int pump_one(sde_execset *s, size_t i)
     sde_mutex_unlock(s->lock);
 
     if (n > 0) {
-        notif = notification("exec.output", run_id);
+        notif = notification("proc.output", run_id);
         if (notif != NULL) {
             sde_buf safe;
 
@@ -460,7 +508,7 @@ static int pump_one(sde_execset *s, size_t i)
     }
     sde_buf_free(&out);
     if (exited) {
-        notif = notification("exec.exit", run_id);
+        notif = notification("proc.exit", run_id);
         if (notif != NULL) {
             sde_json_set(notif, "code", sde_json_int((long) code));
             (void) sde_app_notify(s->app, notif);
@@ -470,7 +518,7 @@ static int pump_one(sde_execset *s, size_t i)
     return (n > 0 || exited) ? 1 : 0;
 }
 
-int sde_exec_pump(sde_execset *s)
+int sde_procset_pump(sde_procset *s)
 {
     size_t i;
     int    busy = 0;

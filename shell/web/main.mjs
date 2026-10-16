@@ -27,6 +27,7 @@
  */
 
 import { createClient, isStaleRevision, staleCurrentRevision } from "./rpc.mjs";
+import { LanguageClient } from "./language.mjs";
 import { BOARD_PATH, createBoard, cardsInsideRect, cardsWithin, DEFAULT_SIZE, frameRect, MIN_SIZE, normaliseRect, ZOOM_MAX, ZOOM_MIN } from "./board.mjs";
 import { createHistory } from "./history.mjs";
 import { classicHud, classicLayout, classicRoles, classicTabLabel, classicViewName } from "./classic.mjs";
@@ -307,6 +308,18 @@ function createApp() {
   /* -- state -- */
   const board = createBoard();
   let client = null;
+  /*
+   * One language client for the whole window.
+   *
+   * Every editor card shares it, so the subsystem catalog is asked once and a
+   * card opened later does not repeat the question.  It is not the kernel's
+   * client: language questions travel as `subsystem.request` through the same
+   * connection, and the adapter is the subsystem's business.
+   */
+  const language = new LanguageClient({
+    call: (method, params) => client.call(method, params),
+    log: (level, message) => log(level, message),
+  });
   let boardRevision = null;
   let dirty = false;
   let saving = false;
@@ -346,7 +359,7 @@ function createApp() {
   const mounted = new Map();
   /** linkId -> {group, path, label, bg} */
   const linkNodes = new Map();
-  /** runId -> cardId, so exec.output finds its runner even before the reply lands */
+  /** runId -> cardId, so proc.output finds its runner even before the reply lands */
   const runs = new Map();
 
   // The model is the single source of truth: anything that changes it schedules
@@ -655,7 +668,7 @@ function createApp() {
       seen.add(card.id);
       let entry = mounted.get(card.id);
       if (entry === undefined) {
-        const node = renderCard(card, { client, app });
+        const node = renderCard(card, { client, app, language });
         node.el.style.width = `${card.w}px`;
         node.el.style.height = `${card.h}px`;
         node.el.dataset.kind = card.kind;
@@ -2071,14 +2084,14 @@ function createApp() {
         revision: event.revision,
       });
     });
-    client.on("exec.output", (event) => {
+    client.on("proc.output", (event) => {
       const cardId = runs.get(event.run_id);
       const entry = cardId === undefined ? undefined : mounted.get(cardId);
       if (entry !== undefined && entry.handle.output) {
         entry.handle.output(event.data);
       }
     });
-    client.on("exec.exit", (event) => {
+    client.on("proc.exit", (event) => {
       const cardId = runs.get(event.run_id);
       runs.delete(event.run_id);
       const entry = cardId === undefined ? undefined : mounted.get(cardId);

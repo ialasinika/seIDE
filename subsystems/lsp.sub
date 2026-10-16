@@ -1,0 +1,27 @@
+# A language server, as a subsystem.
+#
+# `launch` is the only machine-specific line, and it is the whole
+# configuration: point it at the server you have.  The stub below speaks the
+# real protocol and needs nothing installed, so a fresh checkout works.
+# Replace it with one of these and restart the shell:
+#
+#     launch rust-analyzer
+#     launch clangd
+#     launch pyright-langserver --stdio
+#     launch typescript-language-server --stdio
+#
+# `{here}` in a launch line is the directory this descriptor's module lives in,
+# which is how the stub is found from any workspace.  A real server is named
+# exactly as you would type it in a terminal.
+#
+# The server is started the first time the client asks it something
+# (`autostart yes`), because a server nobody has asked a question is a process
+# nobody wanted, and it is stopped when the shell exits.
+id lsp
+title Language server
+kind process
+module lsp.mjs
+capabilities completion diagnostics hover definition format
+autostart yes
+launch node "{here}/lsp-stub.mjs"
+description LSP client: completion, diagnostics, hover and definition from a real language server

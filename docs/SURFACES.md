@@ -197,7 +197,8 @@ to invent kinds.
 | a database browser | one kind; `render` calls `workspace.list`-style RPCs on a new kernel method |
 | a form-based config editor | `sheet`, unchanged, with a tighter column type set |
 | a second text language | **no kind at all** — drop a `.lang` descriptor into `langs/` |
+| a language server: completion, diagnostics, hover, definition, format | **no kind at all** — a `.sub` descriptor in `subsystems/` and a module; the editor card already asks, and picks its subsystem from the declared capabilities |
 | a different note card | `registerCardKind({kind: "note", replace: true, …})` |
 
-The first five need no C, no protocol change and no board-model change. Only a
+The first six need no C, no protocol change and no board-model change. Only a
 new *kernel capability* (a new filesystem or process query) touches `core/`.

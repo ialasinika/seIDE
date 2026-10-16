@@ -169,6 +169,7 @@ the trade-off is explicit rather than discovered.
 | `classic.mjs` | the board works as always, but there is no second arrangement: no code area, no tab strip, no sidebar column, and `mode classic` is not a mode. |
 | `style.css` | the board still works, but it renders as unstyled white boxes stacked at the origin. The editor's colour layer and text layer stop lining up. |
 | `main.mjs` | `index.html` has nothing to boot: a blank dark page. |
+| `language.mjs` | the editor still edits, but nothing asks a subsystem for anything: no completion list, no issue strip, no hover or definition, and no formatting edit. |
 | `index.html` | nothing is served at `/`; `main.mjs` is still a valid module. |
 | `selftest.mjs` | nothing at runtime. You lose the only check that the protocol plumbing still works. |
 
@@ -244,7 +245,13 @@ dialog anywhere:
 | `Enter` | keep the line's indentation, and step in one more after a line ending in `{`, `(` or `[` |
 | `Ctrl+F` | open the card's find bar: find, next/previous hit, replace, replace-all |
 | `Ctrl+S` | write the file — the board's own shortcuts never fire while you type |
-| `Esc` | close the find bar |
+| `Ctrl+Space` | ask the subsystems for completions; the list opens under the editor |
+| `↑` / `↓` | move through the completion list while it is open |
+| `Enter` / `Tab` | take the highlighted completion, replacing the word it completes |
+| `F12` | go to the definition of the word at the caret |
+| `Ctrl+I` | print the hover for the word at the caret: its first line, and where it came from |
+| `Ctrl+.` / `Ctrl+Shift+.` | next / previous issue, selecting it |
+| `Esc` | close the completion list, or the find bar |
 
 Every hit is painted in the colour layer as well as selected in the textarea, so
 matches stay visible while the caret is in the find bar. The indent, auto-indent
@@ -254,6 +261,18 @@ away: after a `Tab`, `Ctrl+Z` still takes that `Tab` back. The pure parts
 (`indentSelection`, `indentAfterEnter`, `findMatches`, `replaceMatchAt`,
 `replaceAllMatches`, `markHits`) are exported for `selftest.mjs`; the wiring is
 pressed for real by `tools/input_smoke.py`.
+
+#### Completions and issues are docked rows, not a popup at the caret
+
+A `<textarea>` has no selection rectangle to read, and a mirror element built
+only to place a floating list would be a second copy of the text that can
+disagree with the real one. The honest shape is a row that is always in the same
+place: a completion list and an issue strip under the editor, driven by the
+keyboard. Which subsystem answers a capability, how completions are ranked, and
+how LSP ranges become line and column are pure and live in `language.mjs`; the
+arithmetic is covered by `selftest.mjs`, and the two bars are pressed for real by
+`tools/input_smoke.py` (which also fails the run on any exception the page
+throws, because a listener that throws changes no DOM node).
 
 ### Finding things across the workspace
 
@@ -383,6 +402,16 @@ the caller hides it rather than drawing it at 0,0.
   the board on every render), no tab reordering that survives anything, no second
   layout to save, and no effect on the protocol or on `board.json`. Hide a card
   and it is still open; the board is what is real.
+* Language answers are **advisory and asked for sparingly**. Completions are
+  requested on `Ctrl+Space` only; diagnostics are debounced by 400 ms, and a
+  subsystem that answers `stale: true` is asked once more with `wait` rather than
+  being drawn as "nothing is wrong"; a subsystem that raises is put on ice until
+  `invalidate()`, so a dead server cannot turn every keystroke into a round trip.
+  Answers are not cached across buffers, hover prints one line to the log rather
+  than opening a frame, and there is no signature help, no rename, no code action
+  and no key for `format` — it is a method the client can ask for, not a binding.
+  With no subsystem running the editor falls back to `words` (every identifier in
+  the buffer), which is a completion list, not a language.
 
 ---
 
@@ -411,6 +440,13 @@ retry button, the status light turns red, the UI stays fully interactive, and it
 keeps retrying with backoff. There is never a blank page and never a
 console-only error.
 
+`subsystem.list/start/stop/status/request` are part of the same interface, not a
+second one: the shell answers them out of `subsystems/` on the same terms as
+`file.*`, and a `subsystem.request` is a nested JSON-RPC call whose result is the
+subsystem's own. The client chooses a subsystem from the capabilities declared in
+its `.sub` descriptor, so a fork that ships different subsystems needs no change
+in `shell/web/`; see `docs/SUBSYSTEMS.md`.
+
 ---
 
 ## Self-test
@@ -432,5 +468,10 @@ or overlap and stays inside the viewport at several sizes), the watcher's
 decision table (a clean card
 adopts new bytes, a dirty one is only warned, a revision that cannot be compared
 is never a reload, and one piece of news is reported once), and token-span
-application to a string. It prints `ok N/N` and exits
-non-zero if anything fails.
+application to a string. It also drives `language.mjs` against fake channels:
+which subsystem answers a capability and in what order, the prefix and ranking
+arithmetic, LSP ranges into line and column, diagnostics normalised from either
+shape, the once-with-`wait` retry when a subsystem says its answer is stale, and
+that a shell with no subsystems is asked exactly once. It prints `ok N/N` (130
+today) and exits non-zero if anything fails — every check is awaited before that
+count is taken, which it was not until the fix recorded in `docs/BUGS.md`.

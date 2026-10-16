@@ -34,7 +34,8 @@ typedef struct sde_app sde_app;
  * that validates its own document -- the reference shell does -- is the one
  * that answers with it.  See `docs/PROTOCOL.md`.
  */
-#define SDE_RPC_EXEC            1005
+/* Nothing was asked for the process, or it could not be started. */
+#define SDE_RPC_PROC            1005
 
 /*
  * Builds an error response by hand.  Used by the reader loop for frames that

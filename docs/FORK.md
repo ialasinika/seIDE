@@ -67,7 +67,7 @@ The cuts a fork usually makes first, in ascending order of pain:
 | cut | effort | what you lose |
 | --- | --- | --- |
 | `langs/` (the whole language layer) | `rm -rf langs/`; the shell falls back automatically | colouring; the editor renders plain text |
-| `exec` | 4 edits + `app.c` | `runner` cards and `exec.*` methods |
+| `proc` | 4 edits + `app.c` | `runner` cards, `proc.*` methods and every process subsystem |
 | `view` | 4 edits + `app.c` + heavy shell changes | persistence of the layout — and with it the ability to keep any document at all |
 | `wksp` | 4 edits + the `editor`, `search`, `files` and `project` card kinds | files; the canvas alone remains |
 | `serve` | 4 edits + the `rpc` subcommand | any way into the process |
@@ -140,7 +140,8 @@ The five functions that most often get a port wrong, in the order they bite:
 | `sde_proc_start` / `sde_proc_read` / `sde_proc_kill` | a real two-pipe spawn with a **non-blocking** read (`>0` bytes, `0` nothing pending, `-1` exited and drained) |
 | `sde_port_replace_file` | an atomic replace; a truncated board is a corrupted project |
 | `sde_port_path_norm` / `sde_port_path_within` | containment must be lexical and correct (`..` escapes) |
-| `sde_mutex_*` / `sde_thread_*` | the exec pump thread is real; a stub `mutex` that does nothing is a data race on stdout |
+| `sde_proc_write` / `sde_proc_close_input` | the write half of the channel: a queued write that never blocks the request loop |
+| `sde_mutex_*` / `sde_thread_*` | the proc pump thread and the stdin writer are real; a stub `mutex` that does nothing is a data race on stdout |
 | `sde_port_startup` | binary mode on the protocol streams and non-inheritable standard handles, so a child cannot keep the shell's pipes open after the kernel exits |
 
 **Cost:** a day for POSIX, more if you also need `proc`'s process-tree kill
@@ -267,7 +268,7 @@ The transport is deliberately the thinnest thing in the project.
   > replace `sde_serve` with a socket loop and nothing above it changes.
 
   The two constraints to keep are (a) one JSON object per frame, and (b) one
-  writer at a time — the output mutex exists because the exec pump thread and
+  writer at a time — the output mutex exists because the proc pump thread and
   the request loop both emit.
 
 - **Shell side:** `shell/main.mjs`'s `Kernel` class spawns `<binary> rpc --root
@@ -325,7 +326,7 @@ What a WRY host must provide, in terms of what exists now:
    webview, so `shell/web/` runs unmodified. Rewriting the UI natively is a
    separate, much larger decision and would discard `board.mjs` and `cards.mjs`,
    which are the parts with no obvious native equivalent.
-5. **Consider the notification rate.** The kernel emits an `exec.output`
+5. **Consider the notification rate.** The kernel emits a `proc.output`
    notification per 8192 bytes per 15 ms pass, and the shell forwards each one
    over SSE. A webview's IPC is heavier than a browser's; a native host may want
    to coalesce output frames before injecting them. (Nothing in the repository

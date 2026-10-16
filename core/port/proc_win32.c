@@ -3,14 +3,16 @@
  *
  * Each child gets three pipes:
  *
- *   stdin   <- the NUL device, so a runner can never eat the shell's
- *              protocol stream by accident
+ *   stdin   <- a writer thread (a private pipe, never the kernel's own)
  *   stdout  -> a reader thread
  *   stderr  -> a reader thread
  *
  * Reader threads append tagged chunks to a small mutex-guarded queue.  The
  * kernel polls that queue from its single main loop, so no part of the IDE
  * outside this file has to know about threads, handles or blocking reads.
+ * The writer thread owns the one blocking call in the other direction and
+ * takes bytes from a bounded queue, so a call to sde_proc_write() can never
+ * block the kernel's RPC loop on a child that has stopped reading.
  */
 #include "seide_cfg.h"
 
@@ -24,10 +26,14 @@
 #include "port.h"
 
 #define PROC_READ_BUF 4096
+#define PROC_WRITE_BUF 4096
+/* A child that stops reading its input must not grow the kernel's memory. */
+#define PROC_WRITE_MAX (1024u * 1024u)
+#define PROC_WRITE_IDLE_MS 5
 
 typedef struct pchunk {
     struct pchunk *next;
-    int            stream;   /* 'o' or 'e' */
+    int            stream;   /* 'o' or 'e' from the child, 'i' towards it */
     char          *data;
     size_t         len;
     size_t         off;
@@ -43,17 +49,25 @@ typedef struct sde_reader {
 
 struct sde_proc {
     HANDLE      process;
+    HANDLE      in_read;
+    HANDLE      in_write;
     HANDLE      out_read;
     HANDLE      err_read;
-    HANDLE      nul;
+    sde_thread *t_in;
     sde_thread *t_out;
     sde_thread *t_err;
     sde_reader  readers[2];
     sde_mutex  *lock;
     pchunk     *head;
     pchunk     *tail;
+    pchunk     *whead;
+    pchunk     *wtail;
+    size_t      wqueued;
+    int         input_closing;
+    int         input_closed;
     int         exited;
     int         exit_code;
+    volatile LONG writer_stop;
     volatile LONG readers_done;
 };
 
@@ -118,7 +132,12 @@ static void reader_main(void *ud)
     (void) InterlockedIncrement(&p->readers_done);
 }
 
-static int make_pipe(HANDLE *rd, HANDLE *wr)
+/*
+ * `inherit_read` says which end the child keeps: the reading end for the two
+ * output pipes, the writing end for stdin.  The end this process keeps must
+ * not be inherited, or the child would hold a copy of it and never see EOF.
+ */
+static int make_pipe(HANDLE *rd, HANDLE *wr, int inherit_read)
 {
     SECURITY_ATTRIBUTES sa;
 
@@ -129,12 +148,168 @@ static int make_pipe(HANDLE *rd, HANDLE *wr)
     if (!CreatePipe(rd, wr, &sa, 0)) {
         return -1;
     }
-    /* The reading end stays ours alone; only the writer is inherited. */
-    if (!SetHandleInformation(*rd, HANDLE_FLAG_INHERIT, 0)) {
+    if (!SetHandleInformation(inherit_read ? *wr : *rd, HANDLE_FLAG_INHERIT, 0)) {
         CloseHandle(*rd);
         CloseHandle(*wr);
         return -1;
     }
+    return 0;
+}
+
+/* Called with `lock` held: forgets queued input the child will never read. */
+static void drop_wqueue_locked(struct sde_proc *p)
+{
+    pchunk *c;
+
+    while (p->whead != NULL) {
+        c = p->whead;
+        p->whead = c->next;
+        free(c->data);
+        free(c);
+    }
+    p->wtail = NULL;
+    p->wqueued = 0;
+}
+
+/*
+ * Moves queued bytes into the child's stdin, one bounded block at a time so
+ * the lock is never held across a blocking write.  Ends when the queue is
+ * empty and stdin has been asked to close, or when the pipe breaks.
+ */
+static void writer_main(void *ud)
+{
+    struct sde_proc *p = (struct sde_proc *) ud;
+    char             buf[PROC_WRITE_BUF];
+
+    for (;;) {
+        pchunk *c;
+        size_t  want = 0;
+        int     do_close = 0;
+        HANDLE  h;
+
+        sde_mutex_lock(p->lock);
+        if (p->writer_stop) {
+            sde_mutex_unlock(p->lock);
+            break;
+        }
+        c = p->whead;
+        if (c != NULL) {
+            want = c->len - c->off;
+            if (want > sizeof(buf)) {
+                want = sizeof(buf);
+            }
+            memcpy(buf, c->data + c->off, want);
+            c->off += want;
+            p->wqueued -= want;
+            if (c->off >= c->len) {
+                p->whead = c->next;
+                if (p->whead == NULL) {
+                    p->wtail = NULL;
+                }
+                free(c->data);
+                free(c);
+            }
+        } else if (p->input_closing && !p->input_closed) {
+            do_close = 1;
+        }
+        h = p->in_write;
+        sde_mutex_unlock(p->lock);
+
+        if (want > 0) {
+            DWORD wrote = 0;
+
+            if (h == NULL
+                || !WriteFile(h, buf, (DWORD) want, &wrote, NULL)
+                || wrote == 0) {
+                sde_mutex_lock(p->lock);
+                drop_wqueue_locked(p);
+                p->input_closed = 1;
+                sde_mutex_unlock(p->lock);
+                break;
+            }
+            continue; /* drain while there is anything to drain */
+        }
+        if (do_close) {
+            if (h != NULL) {
+                CloseHandle(h);
+            }
+            sde_mutex_lock(p->lock);
+            p->in_write = NULL;
+            p->input_closed = 1;
+            p->input_closing = 0;
+            sde_mutex_unlock(p->lock);
+            break;
+        }
+        sde_port_sleep_ms(PROC_WRITE_IDLE_MS);
+    }
+}
+
+int sde_proc_write(sde_proc *p, const char *data, size_t len,
+                   char *err, size_t errcap)
+{
+    pchunk *c;
+    char   *copy;
+
+    if (p == NULL) {
+        set_err(err, errcap, "no such process", NULL);
+        return -1;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    if (data == NULL) {
+        set_err(err, errcap, "nothing to write", NULL);
+        return -1;
+    }
+
+    sde_mutex_lock(p->lock);
+    if (p->input_closed || p->input_closing) {
+        sde_mutex_unlock(p->lock);
+        set_err(err, errcap, "the process input has been closed", NULL);
+        return -1;
+    }
+    if (p->wqueued + len > PROC_WRITE_MAX) {
+        sde_mutex_unlock(p->lock);
+        set_err(err, errcap, "the process is not reading its input", NULL);
+        return -1;
+    }
+    copy = (char *) malloc(len);
+    c = (pchunk *) malloc(sizeof(pchunk));
+    if (copy == NULL || c == NULL) {
+        free(copy);
+        free(c);
+        sde_mutex_unlock(p->lock);
+        set_err(err, errcap, "out of memory", NULL);
+        return -1;
+    }
+    memcpy(copy, data, len);
+    c->next = NULL;
+    c->stream = 'i';
+    c->data = copy;
+    c->len = len;
+    c->off = 0;
+    if (p->wtail == NULL) {
+        p->whead = c;
+        p->wtail = c;
+    } else {
+        p->wtail->next = c;
+        p->wtail = c;
+    }
+    p->wqueued += len;
+    sde_mutex_unlock(p->lock);
+    return 0;
+}
+
+int sde_proc_close_input(sde_proc *p)
+{
+    if (p == NULL) {
+        return -1;
+    }
+    sde_mutex_lock(p->lock);
+    if (!p->input_closed) {
+        p->input_closing = 1;
+    }
+    sde_mutex_unlock(p->lock);
     return 0;
 }
 
@@ -144,6 +319,8 @@ sde_proc *sde_proc_start(const char *cmd, const char *cwd,
     struct sde_proc *p;
     STARTUPINFOA     si;
     PROCESS_INFORMATION pi;
+    HANDLE           in_read = NULL;
+    HANDLE           in_write = NULL;
     HANDLE           out_write = NULL;
     HANDLE           err_write = NULL;
     char            *mutable_cmd;
@@ -168,20 +345,26 @@ sde_proc *sde_proc_start(const char *cmd, const char *cwd,
         return NULL;
     }
 
-    if (make_pipe(&p->out_read, &out_write) != 0
-        || make_pipe(&p->err_read, &err_write) != 0) {
+    if (make_pipe(&in_read, &in_write, 1) != 0
+        || make_pipe(&p->out_read, &out_write, 0) != 0
+        || make_pipe(&p->err_read, &err_write, 0) != 0) {
         set_err(err, errcap, "cannot create pipes for", cmd);
+        if (in_read != NULL) {
+            CloseHandle(in_read);
+        }
+        if (in_write != NULL) {
+            CloseHandle(in_write);
+        }
         sde_proc_free(p);
         return NULL;
     }
-
-    p->nul = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                         NULL, OPEN_EXISTING, 0, NULL);
+    p->in_read = in_read;
+    p->in_write = in_write;
 
     memset(&si, 0, sizeof(si));
     si.cb = (DWORD) sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = (p->nul == INVALID_HANDLE_VALUE) ? NULL : p->nul;
+    si.hStdInput = in_read;
     si.hStdOutput = out_write;
     si.hStdError = err_write;
 
@@ -214,9 +397,14 @@ sde_proc *sde_proc_start(const char *cmd, const char *cwd,
     }
     free(mutable_cmd);
 
-    /* Our copies of the write ends must go, or the readers never see EOF. */
+    /*
+     * Our copies of the child's ends must go, or the readers never see EOF
+     * and a child reading its stdin never sees the end of its input.
+     */
     CloseHandle(out_write);
     CloseHandle(err_write);
+    CloseHandle(in_read);
+    p->in_read = NULL;
     CloseHandle(pi.hThread);
 
     p->process = pi.hProcess;
@@ -229,8 +417,9 @@ sde_proc *sde_proc_start(const char *cmd, const char *cwd,
 
     p->t_out = sde_thread_start(reader_main, &p->readers[0]);
     p->t_err = sde_thread_start(reader_main, &p->readers[1]);
-    if (p->t_out == NULL || p->t_err == NULL) {
-        set_err(err, errcap, "cannot start reader threads", NULL);
+    p->t_in = sde_thread_start(writer_main, p);
+    if (p->t_out == NULL || p->t_err == NULL || p->t_in == NULL) {
+        set_err(err, errcap, "cannot start process threads", NULL);
         sde_proc_free(p);
         return NULL;
     }
@@ -338,6 +527,11 @@ void sde_proc_free(sde_proc *p)
     }
 
     sde_proc_kill(p);
+    p->writer_stop = 1;
+    if (p->t_in != NULL) {
+        sde_thread_join(p->t_in);
+        p->t_in = NULL;
+    }
     if (p->t_out != NULL) {
         sde_thread_join(p->t_out);
         p->t_out = NULL;
@@ -350,6 +544,14 @@ void sde_proc_free(sde_proc *p)
         CloseHandle(p->process);
         p->process = NULL;
     }
+    if (p->in_read != NULL) {
+        CloseHandle(p->in_read);
+        p->in_read = NULL;
+    }
+    if (p->in_write != NULL) {
+        CloseHandle(p->in_write);
+        p->in_write = NULL;
+    }
     if (p->out_read != NULL) {
         CloseHandle(p->out_read);
         p->out_read = NULL;
@@ -358,14 +560,16 @@ void sde_proc_free(sde_proc *p)
         CloseHandle(p->err_read);
         p->err_read = NULL;
     }
-    if (p->nul != NULL && p->nul != INVALID_HANDLE_VALUE) {
-        CloseHandle(p->nul);
-        p->nul = NULL;
-    }
 
     while (p->head != NULL) {
         c = p->head;
         p->head = c->next;
+        free(c->data);
+        free(c);
+    }
+    while (p->whead != NULL) {
+        c = p->whead;
+        p->whead = c->next;
         free(c->data);
         free(c);
     }

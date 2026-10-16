@@ -35,6 +35,8 @@
  * and that the pre must be scrolled in lockstep with the textarea.
  */
 
+import { LanguageClient, formatDiagnostic, insertCompletion } from "./language.mjs";
+
 /**
  * Kinds the wire may carry, mapped to the class suffix `style.css` styles.
  * `ws` and `ident` are emitted by `langs/tokenize.mjs` even though the contract
@@ -675,7 +677,7 @@ export function parseZoomArgument(arg, current = 1) {
 /* ------------------------------------------------------------------ */
 
 /**
- * A bounded text accumulator for `exec.output`.
+ * A bounded text accumulator for `proc.output`.
  *
  * Runs can emit unbounded output; keeping all of it would eventually freeze the
  * window, so once the cap is passed the *head* is dropped -- both in characters
@@ -739,7 +741,7 @@ export class OutputBuffer {
   }
 }
 
-/** `exec.exit` -> the short suffix the runner card shows. */
+/** `proc.exit` -> the short suffix the runner card shows. */
 export function formatExit(code) {
   if (code === null || code === undefined) {
     return "running";
@@ -1553,6 +1555,18 @@ export function markHits(segments, hits, current = -1) {
 
 function renderEditor(card, ctx) {
   const { client, app } = ctx;
+  /*
+   * Language questions go to a subsystem, never to the kernel.  The client is
+   * the shell's (`subsystem.request`), and `ctx.language` lets the app hand in
+   * one shared instance so the catalog is asked once for the whole window
+   * rather than once per card.
+   */
+  const language = ctx.language instanceof LanguageClient
+    ? ctx.language
+    : new LanguageClient({
+      call: (method, params) => client.call(method, params),
+      log: (level, message) => app.log(level, message),
+    });
 
   const pre = h("pre", "ed-view", { attrs: { "aria-hidden": "true" } });
   const area = h("textarea", "ed-input", {
@@ -1606,8 +1620,32 @@ function renderEditor(card, ctx) {
     ],
   });
 
+  /*
+   * The completion list and the issue strip are docked rows under the editor
+   * rather than floating popups.  A `<textarea>` has no selection rectangle to
+   * read, and a mirror element just to place a popup would be a second copy of
+   * the text that can disagree with the real one.  Docked is honest, keyboard
+   * first, and correct at every zoom -- and it is exactly the same information.
+   */
+  const completionList = h("div", "ed-complete-list", {
+    attrs: { "data-role": "completion-list", role: "listbox", "aria-label": "completions" },
+  });
+  const completionBar = h("div", "ed-complete", {
+    attrs: { hidden: "", "data-role": "completion" },
+    children: [completionList],
+  });
+  const issueList = h("div", "ed-issues-list", {
+    attrs: { "data-role": "issues-list" },
+  });
+  const issueBar = h("div", "ed-issues", {
+    attrs: { hidden: "", "data-role": "issues" },
+    children: [issueList],
+  });
+
   const status = makeStatus();
-  const body = h("div", "card-body card-body-editor", { children: [findBar, surface, status] });
+  const body = h("div", "card-body card-body-editor", {
+    children: [findBar, surface, completionBar, issueBar, status],
+  });
 
   const state = {
     path: typeof card.file === "string" ? card.file : "",
@@ -1620,13 +1658,34 @@ function renderEditor(card, ctx) {
     findOpen: false,
     hits: [],
     hitIndex: -1,
+    // Language: the completion list, which row is highlighted, the issues the
+    // last answer named, and the generation counters that keep a stale reply
+    // from overwriting a newer one.
+    completions: [],
+    completionIndex: -1,
+    completionSeq: 0,
+    completionTimer: null,
+    source: null,
+    issues: [],
+    issueSeq: 0,
+    issueTimer: null,
   };
 
   const shell = cardShell(card, body);
   shell.label.textContent = state.path || "(no file)";
   shell.label.title = state.path;
 
+  // The last thing this card did that the user should know about: "loaded · lf ·
+  // 4 bytes", "reloaded from disk", "saved", "write failed".  A bare
+  // renderStatus() repaints for a new revision or a new issue count and must not
+  // eat that sentence -- whether the editor read this file or the watcher noticed
+  // it change under you is the whole difference the sentence exists to make.
+  let statusNote = "";
+
   function renderStatus(message) {
+    if (message) {
+      statusNote = message;
+    }
     const bits = [];
     if (state.path === "") {
       bits.push("no file — type `open <path>` below");
@@ -1641,8 +1700,8 @@ function renderEditor(card, ctx) {
         bits.push("saving…");
       }
     }
-    if (message) {
-      bits.push(message);
+    if (statusNote) {
+      bits.push(statusNote);
     }
     status.textContent = bits.join(" · ");
   }
@@ -1975,6 +2034,263 @@ function renderEditor(card, ctx) {
     }, 120);
   }
 
+  /* ---- language: completion, diagnostics, hover, definition ---- */
+
+  /*
+   * Words from the *other* open editors, for the completion list.  The handle
+   * exposes a card's path and dirty flag, not its text, so this stays empty
+   * today: `words` completes from the buffer in front of you, and a project
+   * word list would be a second source of truth about text this card does not
+   * own.  The wire already carries the member (`words`), so filling it in later
+   * is a client change and nothing else.
+   */
+  function projectWords() {
+    return [];
+  }
+
+  function renderCompletions(answer) {
+    completionList.replaceChildren();
+    state.completions.forEach((item, index) => {
+      const row = h("div", index === state.completionIndex ? "ed-complete-row on" : "ed-complete-row", {
+        attrs: {
+          role: "option",
+          "aria-selected": index === state.completionIndex ? "true" : "false",
+          "data-role": "completion-row",
+        },
+        text: item.label,
+      });
+      if (item.detail) {
+        row.title = String(item.detail);
+      }
+      row.addEventListener("mousedown", (event) => {
+        // mousedown, not click: the textarea must not lose the caret first.
+        event.preventDefault();
+        state.completionIndex = index;
+        acceptCompletion();
+      });
+      completionList.append(row);
+    });
+    const shown = state.completions.length;
+    completionBar.hidden = false;
+    // Which subsystem answered, as data: the status line above says it in words,
+    // and the shell's smoke test reads it back to name the source it proved.
+    completionBar.dataset.source = state.source;
+    renderStatus(`${shown}${answer.truncated ? "+" : ""} from ${state.source}${showCountHint()}`);
+  }
+
+  function showCountHint() {
+    return state.issues.length === 0 ? "" : ` · ${state.issues.length} issue${state.issues.length === 1 ? "" : "s"}`;
+  }
+
+  function closeCompletions() {
+    state.completions = [];
+    state.completionIndex = -1;
+    completionList.replaceChildren();
+    completionBar.hidden = true;
+  }
+
+  async function requestCompletions() {
+    if (state.path === "") {
+      app.log("warn", "no file: there is nothing to complete in");
+      return;
+    }
+    const text = area.value;
+    const offset = area.selectionStart;
+    const seq = state.completionSeq + 1;
+    state.completionSeq = seq;
+    let answer = null;
+    try {
+      answer = await language.complete({ path: state.path, text, offset, words: projectWords() });
+    } catch (err) {
+      app.log("warn", `completion failed: ${err.message}`);
+      return;
+    }
+    // A reply that lost the race is dropped: the caret moved, so the list would
+    // be about a different position.
+    if (seq !== state.completionSeq || area.value !== text || area.selectionStart !== offset) {
+      return;
+    }
+    if (answer === null || answer.items.length === 0) {
+      closeCompletions();
+      renderStatus("no completions");
+      return;
+    }
+    state.completions = answer.items;
+    state.completionIndex = 0;
+    state.source = answer.source;
+    renderCompletions(answer);
+  }
+
+  function stepCompletion(delta) {
+    const count = state.completions.length;
+    if (count === 0) {
+      return;
+    }
+    state.completionIndex = ((state.completionIndex + delta) % count + count) % count;
+    renderCompletions({ truncated: false });
+    const row = completionList.children[state.completionIndex];
+    if (row !== undefined && typeof row.scrollIntoView === "function") {
+      row.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  /**
+   * Insert the highlighted completion.
+   *
+   * The edit goes in as one user edit (`rewrite` -> `execCommand`), so Ctrl+Z
+   * takes it back; the caret lands after the inserted word, and the list closes.
+   */
+  function acceptCompletion() {
+    const item = state.completions[state.completionIndex];
+    if (item === undefined) {
+      closeCompletions();
+      return;
+    }
+    const next = insertCompletion(area.value, area.selectionStart, item.label);
+    closeCompletions();
+    if (next.text !== area.value) {
+      rewrite(next.text, next.caret, next.caret, `inserted ${item.label}`);
+    } else {
+      area.setSelectionRange(next.caret, next.caret);
+    }
+  }
+
+  /* ---- the issue strip ---- */
+
+  function renderIssues() {
+    issueList.replaceChildren();
+    for (const issue of state.issues) {
+      const row = h("div", `ed-issue sev-${issue.severity}`, {
+        attrs: { "data-role": "issue-row", "data-severity": issue.severity },
+        text: formatDiagnostic(issue),
+      });
+      row.title = issue.code === null ? issue.message : `${issue.code}: ${issue.message}`;
+      row.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        area.focus();
+        area.setSelectionRange(issue.start, issue.end > issue.start ? issue.end : issue.start);
+        renderStatus(formatDiagnostic(issue));
+      });
+      issueList.append(row);
+    }
+    issueBar.dataset.source = state.source;
+    issueBar.hidden = state.issues.length === 0;
+  }
+
+  /** Jump the caret to the next issue after it, wrapping. */
+  function stepIssue(delta) {
+    if (state.issues.length === 0) {
+      app.log("info", "no issues here");
+      return;
+    }
+    const caret = area.selectionStart;
+    const forward = delta >= 0;
+    let index = forward
+      ? state.issues.findIndex((issue) => issue.start > caret)
+      : -1;
+    if (!forward) {
+      for (let i = state.issues.length - 1; i >= 0; i -= 1) {
+        if (state.issues[i].start < caret) {
+          index = i;
+          break;
+        }
+      }
+    }
+    if (index === -1) {
+      index = forward ? 0 : state.issues.length - 1;
+    }
+    const issue = state.issues[index];
+    area.focus();
+    area.setSelectionRange(issue.start, issue.end > issue.start ? issue.end : issue.start);
+    renderStatus(`${index + 1}/${state.issues.length} · ${formatDiagnostic(issue)}`);
+  }
+
+  /**
+   * Ask what is wrong with the buffer.
+   *
+   * Debounced harder than tokenising: a language server is a process, and one
+   * question per keystroke would be one round trip per keystroke.  A reply for a
+   * buffer that has since changed is dropped, so the strip never describes text
+   * the user cannot see.
+   */
+  async function diagnoseNow() {
+    const text = area.value;
+    const path = state.path;
+    if (path === "") {
+      state.issues = [];
+      issueBar.dataset.answer = "no file";
+      renderIssues();
+      renderStatus();
+      return;
+    }
+    const seq = state.issueSeq + 1;
+    state.issueSeq = seq;
+    let answer = null;
+    try {
+      answer = await language.diagnose({ path, text });
+    } catch (err) {
+      app.log("warn", `diagnostics failed: ${err.message}`);
+      return;
+    }
+    if (seq !== state.issueSeq || area.value !== text) {
+      return;
+    }
+    state.issues = answer === null ? [] : answer.diagnostics;
+    state.source = answer === null ? state.source : answer.source;
+    // What the answer said, as data.  The strip shows the rows; a reader needs
+    // to be able to tell "the server says there is nothing wrong" from "the
+    // server has not said anything about this text yet", and the shell's smoke
+    // test reads both back.
+    issueBar.dataset.answer = answer === null
+      ? "none"
+      : `${state.issues.length} of ${answer.total}${answer.truncated ? "+" : ""}${answer.stale ? " stale" : ""}`;
+    renderIssues();
+    renderStatus();
+  }
+
+  function scheduleDiagnose() {
+    if (state.issueTimer !== null) {
+      clearTimeout(state.issueTimer);
+    }
+    state.issueTimer = setTimeout(() => {
+      state.issueTimer = null;
+      diagnoseNow();
+    }, 400);
+  }
+
+  /* ---- hover and definition ---- */
+
+  async function showHover() {
+    if (state.path === "") {
+      return;
+    }
+    const text = area.value;
+    const offset = area.selectionStart;
+    const answer = await language.hover({ path: state.path, text, offset });
+    if (answer === null) {
+      app.log("info", "nothing to say about that");
+      return;
+    }
+    const first = answer.contents.split("\n").find((line) => line.trim() !== "") || answer.contents;
+    app.log("info", `${first.trim()} (${answer.source})`);
+  }
+
+  async function goToDefinition() {
+    if (state.path === "") {
+      return;
+    }
+    const text = area.value;
+    const offset = area.selectionStart;
+    const answer = await language.definition({ path: state.path, text, offset });
+    if (answer === null) {
+      app.log("info", "no definition here");
+      return;
+    }
+    const first = answer.locations[0];
+    app.log("info", `${first.path}:${first.line} (${answer.source})`);
+    app.openFile(first.path, { line: first.line });
+  }
+
   /**
    * The load currently in flight (or the last one), so `goToLine` can wait for
    * the file a card is opening instead of jumping into an empty textarea.
@@ -2014,6 +2330,9 @@ function renderEditor(card, ctx) {
         renderStatus(status);
       }
       scheduleTokenize();
+      // A file that just arrived is worth asking about once, without waiting for
+      // a keystroke: the issues are the first thing a reader wants to know.
+      diagnoseNow();
       return true;
     } catch (err) {
       renderStatus("could not read");
@@ -2115,6 +2434,10 @@ function renderEditor(card, ctx) {
     state.dirty = true;
     renderStatus();
     scheduleTokenize();
+    scheduleDiagnose();
+    // The caret moved with the text, so a completion list about the old one is
+    // no longer true.
+    closeCompletions();
     app.boardTouched(true);
     if (state.findOpen) {
       syncFind({ reveal: false });
@@ -2123,6 +2446,45 @@ function renderEditor(card, ctx) {
 
   area.addEventListener("keydown", (event) => {
     const mod = event.ctrlKey || event.metaKey;
+    // While the list is up it owns the keys it needs, and only those: anything
+    // else falls through to the editor below.
+    if (!completionBar.hidden) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        stepCompletion(event.key === "ArrowDown" ? 1 : -1);
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        acceptCompletion();
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeCompletions();
+        return;
+      }
+    }
+    if (mod && event.key === " ") {
+      event.preventDefault();
+      requestCompletions();
+      return;
+    }
+    if (event.key === "F12") {
+      event.preventDefault();
+      goToDefinition();
+      return;
+    }
+    if (mod && event.key.toLowerCase() === "i") {
+      event.preventDefault();
+      showHover();
+      return;
+    }
+    if (mod && event.key === ".") {
+      event.preventDefault();
+      stepIssue(event.shiftKey ? -1 : 1);
+      return;
+    }
     if (mod && event.key.toLowerCase() === "s") {
       event.preventDefault();
       save();
@@ -2225,6 +2587,22 @@ function renderEditor(card, ctx) {
         openFind();
         return { query: findQuery.value, hits: state.hits.length, index: state.hitIndex };
       },
+      /**
+       * Language questions, awaited by the smoke test.
+       *
+       * The UI paths are the real ones (`^Space`, `F12`); these just return the
+       * promise so a check can wait for the answer instead of guessing a delay.
+       */
+      complete: requestCompletions,
+      diagnose: diagnoseNow,
+      hover: showHover,
+      definition: goToDefinition,
+      get completions() {
+        return state.completions.map((item) => item.label);
+      },
+      get issues() {
+        return state.issues.map((issue) => ({ ...issue }));
+      },
       /** External change: report it, never auto-reload over unsaved edits. */
       onFileChanged(revision) {
         if (revision !== null && revision === state.baseRevision) {
@@ -2315,8 +2693,7 @@ function renderRunner(card, ctx) {
     state.exit = null;
     paint();
     try {
-      const result = await client.call("exec.start", {
-        card_id: card.id,
+      const result = await client.call("proc.start", {
         cmd,
         cwd: typeof card.cwd === "string" && card.cwd !== "" ? card.cwd : ".",
       });
@@ -2327,7 +2704,7 @@ function renderRunner(card, ctx) {
       paint();
     } catch (err) {
       status.textContent = `could not start: ${err.message}`;
-      app.log("error", `exec.start failed: ${err.message}`);
+      app.log("error", `proc.start failed: ${err.message}`);
     }
   }
 
@@ -2336,9 +2713,9 @@ function renderRunner(card, ctx) {
       return;
     }
     try {
-      await client.call("exec.stop", { run_id: state.runId });
+      await client.call("proc.stop", { run_id: state.runId });
     } catch (err) {
-      app.log("error", `exec.stop failed: ${err.message}`);
+      app.log("error", `proc.stop failed: ${err.message}`);
     }
   }
 

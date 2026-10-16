@@ -148,6 +148,25 @@ void      sde_proc_kill(sde_proc *p);
  */
 long sde_proc_read(sde_proc *p, int *stream, sde_buf *out, size_t max);
 
+/*
+ * Non-blocking.  Queues `len` bytes for the child's stdin.  A writer thread
+ * inside this module owns the blocking WriteFile(), so a child that stops
+ * reading its input can never stall the caller; the queue is bounded and a
+ * write that would overflow it fails instead of growing without limit.
+ *
+ * Returns 0, or -1 with `err` filled in (queue full, input already closed,
+ * out of memory).
+ */
+int sde_proc_write(sde_proc *p, const char *data, size_t len,
+                   char *err, size_t errcap);
+
+/*
+ * Closes the child's stdin after everything queued before this call has been
+ * written.  A child that reads until EOF finishes on its own after this;
+ * sde_proc_free() closes the pipe as well if this is never called.
+ */
+int sde_proc_close_input(sde_proc *p);
+
 int  sde_proc_running(sde_proc *p);
 int  sde_proc_exit_code(sde_proc *p);   /* valid once sde_proc_read() is -1 */
 

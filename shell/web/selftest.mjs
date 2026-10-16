@@ -126,12 +126,35 @@ import {
   watchTrimmed,
 } from "./watch.mjs";
 
+import {
+  COMPLETION_LIMIT,
+  LanguageClient,
+  completionPrefix,
+  completionStart,
+  diagnosticAt,
+  formatDiagnostic,
+  insertCompletion,
+  normaliseDiagnostics,
+  offsetOfPosition,
+  positionOf,
+  rankCompletions,
+  severityName,
+} from "./language.mjs";
+
 /* ------------------------------------------------------------------ */
 /* the smallest useful test harness                                    */
 /* ------------------------------------------------------------------ */
 
 const failures = [];
 let checks = 0;
+/**
+ * An async test body runs on after the line that called it, so the report at
+ * the bottom of this file must wait for every one of them. It used to not: the
+ * summary printed while the bodies were still suspended, which meant a failure
+ * in an async test was never printed and never set the exit code. A green
+ * `ok N/N` is only worth what the report behind it is worth.
+ */
+const pending = [];
 
 function test(name, fn) {
   checks += 1;
@@ -142,13 +165,15 @@ function test(name, fn) {
   }
 }
 
-async function testAsync(name, fn) {
+function testAsync(name, fn) {
   checks += 1;
-  try {
-    await fn();
-  } catch (err) {
-    failures.push({ name, err });
-  }
+  pending.push((async () => {
+    try {
+      await fn();
+    } catch (err) {
+      failures.push({ name, err });
+    }
+  })());
 }
 
 /* ------------------------------------------------------------------ */
@@ -1419,8 +1444,8 @@ await testAsync("e2e: a real HTTP host, real SSE and real chunk boundaries", asy
       res.write(`data: ${JSON.stringify({ event: "log", level: "warn", message: "one" })}\n\n`
         + `data: ${JSON.stringify({ event: "log", level: "info", message: "two" })}\n\n`);
       setTimeout(() => {
-        send({ event: "exec.output", run_id: 1, stream: "stdout", data: "out\n" });
-        send({ event: "exec.exit", run_id: 1, code: 0 });
+        send({ event: "proc.output", run_id: 1, stream: "stdout", data: "out\n" });
+        send({ event: "proc.exit", run_id: 1, code: 0 });
         res.end();
       }, 20);
       return;
@@ -1512,8 +1537,8 @@ await testAsync("e2e: a real HTTP host, real SSE and real chunk boundaries", asy
     const client = createClient({ origin: `http://127.0.0.1:${port}` });
     const events = [];
     client.on("log", (event) => events.push(event.message));
-    client.on("exec.output", (event) => events.push(event.data));
-    client.on("exec.exit", (event) => events.push(`exit ${event.code}`));
+    client.on("proc.output", (event) => events.push(event.data));
+    client.on("proc.exit", (event) => events.push(`exit ${event.code}`));
     client.connect();
     await client.ready();
     assert.equal(client.connected, true);
@@ -2590,6 +2615,288 @@ test("classic: the layout is a projection -- it never writes to a card", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* the language layer: what a subsystem is asked, and what comes back   */
+/* ------------------------------------------------------------------ */
+
+test("language: the completion prefix is the word being typed", () => {
+  assert.equal(completionPrefix("const alpha = 1", 8), "al");
+  assert.equal(completionPrefix("const alpha = 1", 5), "const");
+  assert.equal(completionPrefix("a b", 2), "", "a space ends the word");
+  assert.equal(completionPrefix("x", 99), "x", "an offset past the end is clamped");
+  assert.equal(completionPrefix("", 0), "");
+  assert.equal(completionPrefix(undefined, 3), "", "no text, no prefix");
+  assert.equal(completionStart("const alpha = 1", 8), 6);
+  assert.equal(completionStart("a b", 2), 2);
+});
+
+test("language: ranking prefers an exact-case prefix, then the shorter word", () => {
+  const items = [
+    { label: "alphabet", kind: "word", detail: "" },
+    { label: "beta", kind: "word", detail: "" },
+    { label: "Alpha", kind: "word", detail: "" },
+    { label: "alpha", kind: "word", detail: "" },
+    { label: "alpha", kind: "word", detail: "a duplicate of the same word" },
+    null,
+    "not an item",
+    { label: "" },
+  ];
+  const ranked = rankCompletions(items, "al");
+  assert.deepEqual(ranked.items.map((item) => item.label), ["alpha", "alphabet", "Alpha"]);
+  assert.equal(ranked.total, 3, "the duplicate, the junk and the empty label are not candidates");
+  assert.equal(ranked.truncated, false);
+  assert.equal(ranked.prefix, "al");
+});
+
+test("language: a completion equal to what is typed is not offered back", () => {
+  const ranked = rankCompletions([{ label: "al" }, { label: "alpha" }], "al");
+  assert.deepEqual(ranked.items.map((item) => item.label), ["alpha"]);
+});
+
+test("language: the popup is capped, and says that it was", () => {
+  const items = [{ label: "aaa" }, { label: "aab" }, { label: "aac" }];
+  const ranked = rankCompletions(items, "a", 2);
+  assert.equal(ranked.items.length, 2);
+  assert.equal(ranked.total, 3);
+  assert.equal(ranked.truncated, true, "a truncated popup must be able to say so");
+  assert.equal(rankCompletions(null, "a").total, 0, "no list is an empty list, not an error");
+  assert.equal(COMPLETION_LIMIT > 0, true);
+});
+
+test("language: inserting a completion replaces exactly the prefix", () => {
+  const first = insertCompletion("const al", 8, "alpha");
+  assert.equal(first.text, "const alpha");
+  assert.equal(first.caret, 11);
+  const over = insertCompletion("alpha", 5, "beta");
+  assert.equal(over.text, "beta", "the whole typed word goes, not just its tail");
+  assert.equal(over.caret, 4);
+  const appended = insertCompletion("a ", 2, "x");
+  assert.equal(appended.text, "a x", "with no prefix it is an insertion, not a replacement");
+});
+
+test("language: offsets and line/column agree, in both directions", () => {
+  assert.deepEqual(positionOf("ab\ncd", 4), { line: 1, column: 1 });
+  assert.deepEqual(positionOf("ab\ncd", 0), { line: 0, column: 0 });
+  assert.deepEqual(positionOf("ab\ncd", 99), { line: 1, column: 2 }, "a past-the-end offset is the end");
+  assert.equal(offsetOfPosition("ab\ncd", 1, 1), 4);
+  assert.equal(offsetOfPosition("ab\ncd", 0, 1), 1);
+  assert.equal(offsetOfPosition("ab\ncd", 9, 0), 5, "a missing line is the end of the text");
+  assert.equal(offsetOfPosition("ab\ncd", 1, 99), 5, "a column past the line stops at the newline");
+  const text = "one\ntwo\nthree";
+  for (const offset of [0, 3, 4, 7, 13]) {
+    const at = positionOf(text, offset);
+    assert.equal(offsetOfPosition(text, at.line, at.column), offset, `round trip at ${offset}`);
+  }
+});
+
+test("language: diagnostics from either subsystem come out one shape", () => {
+  const fromWords = normaliseDiagnostics("abc", [{ start: 1, end: 2, severity: "error", code: "unclosed", message: "never closed" }]);
+  assert.deepEqual(fromWords.diagnostics, [
+    { start: 1, end: 2, severity: "error", code: "unclosed", message: "never closed", line: 0, column: 1 },
+  ]);
+  const fromLsp = normaliseDiagnostics("ab\ncd", [
+    { range: { start: { line: 1, character: 1 }, end: { line: 1, character: 2 } }, severity: 2, message: "careful" },
+  ]);
+  assert.equal(fromLsp.diagnostics[0].start, 4, "an LSP range is converted to an offset");
+  assert.equal(fromLsp.diagnostics[0].end, 5);
+  assert.equal(fromLsp.diagnostics[0].severity, "warning");
+  assert.deepEqual([fromLsp.diagnostics[0].line, fromLsp.diagnostics[0].column], [1, 1]);
+});
+
+test("language: a span outside the buffer is clamped, not swallowed", () => {
+  const out = normaliseDiagnostics("abc", [
+    { start: -5, end: 99, severity: 1, message: "everywhere" },
+    { start: 5, end: 1, severity: 1, message: "backwards" },
+  ]);
+  assert.deepEqual(out.diagnostics.map((d) => [d.start, d.end]), [[0, 3], [3, 3]], "and sorted by start");
+  const dropped = normaliseDiagnostics("abc", [null, 7, {}, { start: 0, end: 1 }]);
+  assert.equal(dropped.total, 0, "an entry with no message and no code says nothing");
+  const coded = normaliseDiagnostics("abc", [{ start: 0, end: 1, code: "E1" }]);
+  assert.equal(coded.total, 1, "a code with no message is still worth reporting");
+  const capped = normaliseDiagnostics("abcabc", [0, 1, 2].map((i) => ({ start: i, end: i + 1, message: `m${i}` })), 2);
+  assert.equal(capped.diagnostics.length, 2);
+  assert.equal(capped.total, 3);
+  assert.equal(capped.truncated, true);
+});
+
+test("language: the issue under the caret, and how a strip shows one", () => {
+  const out = normaliseDiagnostics("abc", [{ start: 0, end: 2, severity: 1, message: "bad" }]).diagnostics;
+  assert.equal(diagnosticAt(out, 0).message, "bad", "the span includes its start");
+  assert.equal(diagnosticAt(out, 2).message, "bad", "and its end, so the caret at the edge still sees it");
+  assert.equal(diagnosticAt(out, 3), null);
+  assert.equal(diagnosticAt(null, 0), null);
+  assert.equal(formatDiagnostic({ line: 2, column: 15, message: "bad" }), "3:16 bad", "shown one-based");
+  assert.equal(formatDiagnostic(null), "");
+});
+
+test("language: severities are names, whatever the server sent", () => {
+  assert.equal(severityName(1), "error");
+  assert.equal(severityName(2), "warning");
+  assert.equal(severityName(3), "info");
+  assert.equal(severityName(4), "hint");
+  assert.equal(severityName("diagnostic"), "diagnostic", "a name it did not send is kept");
+  assert.equal(severityName(99), "warning");
+  assert.equal(severityName(undefined), "warning");
+});
+
+/** A fake shell: `subsystem.list` answers, and `subsystem.request` is scripted. */
+function fakeShell(catalog, handlers = {}) {
+  const calls = [];
+  const log = [];
+  const call = async (method, params) => {
+    calls.push({ method, params });
+    if (method === "subsystem.list") return { subsystems: catalog };
+    if (method === "subsystem.request") {
+      const key = `${params.id}.${params.method}`;
+      if (typeof handlers[key] === "function") return handlers[key](params);
+      if (key in handlers) {
+        const value = handlers[key];
+        if (value instanceof Error) throw value;
+        return value;
+      }
+      throw new Error(`no handler for ${key}`);
+    }
+    throw new Error(`unexpected method ${method}`);
+  };
+  return { calls, log, client: new LanguageClient({ call, log: (level, message) => log.push(`${level}: ${message}`) }) };
+}
+
+const FAKE_CATALOG = [
+  { id: "words", title: "Words", kind: "builtin", capabilities: ["completion", "diagnostics"], state: "stopped" },
+  { id: "lsp", title: "LSP", kind: "process", capabilities: ["completion", "diagnostics", "hover", "definition", "format"], state: "running" },
+];
+
+testAsync("language: a running server is preferred over a builtin", async () => {
+  const shell = fakeShell(FAKE_CATALOG);
+  assert.equal(await shell.client.preferred("hover"), "lsp");
+  assert.equal(await shell.client.preferred("diagnostics"), "lsp", "a warm server comes first");
+  assert.equal(await shell.client.preferred("vcs"), null, "nothing answers a capability nobody has");
+
+  const quiet = fakeShell([{ id: "words", kind: "builtin", capabilities: ["completion"], state: "stopped" }]);
+  assert.equal(await quiet.client.preferred("completion"), "words");
+  const two = fakeShell([
+    { id: "zebra", kind: "builtin", capabilities: ["completion"], state: "stopped" },
+    { id: "apple", kind: "builtin", capabilities: ["completion"], state: "stopped" },
+  ]);
+  assert.equal(await two.client.preferred("completion"), "apple", "ties break on the id, so the answer is stable");
+});
+
+testAsync("language: completions come from the server, and fall back to words", async () => {
+  const lspAnswer = { items: [{ label: "alpha", kind: 3, detail: "fn alpha()" }], isIncomplete: false };
+  const shell = fakeShell(FAKE_CATALOG, { "lsp.complete": lspAnswer });
+  const fromServer = await shell.client.complete({ path: "a.bf", text: "al", offset: 2 });
+  assert.equal(fromServer.source, "lsp");
+  assert.deepEqual(fromServer.items.map((item) => item.label), ["alpha"]);
+  assert.equal(fromServer.items[0].detail, "fn alpha()");
+  assert.equal(shell.calls.find((c) => c.method === "subsystem.request").params.params.path, "a.bf");
+
+  const fallback = fakeShell(FAKE_CATALOG, {
+    "lsp.complete": new Error("the server is not ready"),
+    "words.complete": { prefix: "al", items: [{ label: "alpha", kind: "word", detail: "in this file" }], total: 1 },
+  });
+  const fromWords = await fallback.client.complete({ path: "a.bf", text: "al", offset: 2 });
+  assert.equal(fromWords.source, "words", "a server that failed is not allowed to hide the fallback");
+  assert.equal(fallback.log.some((line) => line.includes("lsp could not complete")), true);
+
+  const none = fakeShell([{ id: "words", kind: "builtin", capabilities: [], state: "stopped" }]);
+  assert.equal(await none.client.complete({ path: "a.bf", text: "al", offset: 2 }), null, "no answer is not an error");
+});
+
+testAsync("language: diagnostics are normalised whoever answered", async () => {
+  const shell = fakeShell(FAKE_CATALOG, {
+    "lsp.diagnose": {
+      diagnostics: [{ range: { start: { line: 0, character: 1 }, end: { line: 0, character: 2 } }, severity: 1, message: "boom" }],
+    },
+  });
+  const out = await shell.client.diagnose({ path: "a.bf", text: "abc" });
+  assert.equal(out.source, "lsp");
+  assert.deepEqual([out.diagnostics[0].start, out.diagnostics[0].end, out.diagnostics[0].severity], [1, 2, "error"]);
+
+  const fallback = fakeShell(FAKE_CATALOG, {
+    "lsp.diagnose": new Error("gone"),
+    "words.diagnose": { diagnostics: [{ start: 0, end: 1, severity: "warning", message: "odd quotes" }] },
+  });
+  const words = await fallback.client.diagnose({ path: "a.bf", text: "abc" });
+  assert.equal(words.source, "words");
+  assert.equal(words.diagnostics[0].message, "odd quotes");
+
+  // Diagnostics are pushed, so an empty answer that is `stale` means the server
+  // has not spoken about this text yet.  That is asked for again, once.
+  const asked = [];
+  const pushing = fakeShell(FAKE_CATALOG, {
+    "lsp.diagnose": (params) => {
+      asked.push(params);
+      return asked.length === 1
+        ? { diagnostics: [], stale: true, version: 1 }
+        : {
+          diagnostics: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, severity: 2, message: "still here" }],
+          stale: false,
+          version: 2,
+        };
+    },
+  });
+  const later = await pushing.client.diagnose({ path: "a.bf", text: "abc" });
+  assert.equal(asked.length, 2, "a stale answer is asked for again");
+  assert.equal(asked[1].params.wait > 0, true, "and the second ask waits for the push");
+  assert.equal(later.stale, false);
+  assert.equal(later.diagnostics[0].message, "still here");
+
+  // One retry, not a loop: a server that stays quiet is believed.
+  const stubborn = fakeShell(FAKE_CATALOG, { "lsp.diagnose": () => ({ diagnostics: [], stale: true, version: 1 }) });
+  const empty = await stubborn.client.diagnose({ path: "a.bf", text: "abc" });
+  assert.equal(stubborn.calls.filter((entry) => entry.method === "subsystem.request").length, 2);
+  assert.equal(empty.stale, true, "the caller is told the answer is stale");
+  assert.equal(empty.diagnostics.length, 0);
+});
+
+testAsync("language: hover, definition and format are server-only, and quiet when absent", async () => {
+  const answers = {
+    "lsp.hover": { contents: "alpha: the first letter", range: null },
+    "lsp.definition": { locations: [{ path: "b.bf", line: 3, column: 0 }] },
+    "lsp.format": { edits: [{ start: 0, end: 1, text: "A" }], total: 1 },
+  };
+  const shell = fakeShell(FAKE_CATALOG, answers);
+  const hover = await shell.client.hover({ path: "a.bf", text: "alpha", offset: 1 });
+  assert.deepEqual(hover, { contents: "alpha: the first letter", source: "lsp" });
+  const definition = await shell.client.definition({ path: "a.bf", text: "alpha", offset: 1 });
+  assert.equal(definition.locations[0].path, "b.bf");
+  const formatted = await shell.client.format({ path: "a.bf", text: "abc" });
+  assert.equal(formatted.edits.length, 1);
+
+  const wordsOnly = fakeShell([{ id: "words", kind: "builtin", capabilities: ["completion"], state: "stopped" }]);
+  assert.equal(await wordsOnly.client.hover({ path: "a.bf", text: "a", offset: 0 }), null);
+  assert.equal(await wordsOnly.client.definition({ path: "a.bf", text: "a", offset: 0 }), null);
+  assert.equal(await wordsOnly.client.format({ path: "a.bf", text: "a" }), null);
+  assert.equal(await wordsOnly.client.complete({ path: "a.bf", text: "a", offset: 1 }), null);
+
+  const empty = fakeShell(FAKE_CATALOG, { "lsp.hover": { contents: "" }, "lsp.definition": { locations: [] } });
+  assert.equal(await empty.client.hover({ path: "a.bf", text: "a", offset: 0 }), null, "nothing to show is nothing to show");
+  assert.equal(await empty.client.definition({ path: "a.bf", text: "a", offset: 0 }), null);
+});
+
+testAsync("language: a shell without subsystems is asked once, then left alone", async () => {
+  const calls = [];
+  const log = [];
+  const client = new LanguageClient({
+    call: async (method) => {
+      calls.push(method);
+      throw new Error("METHOD_NOT_FOUND: no such method");
+    },
+    log: (level, message) => log.push(`${level}: ${message}`),
+  });
+  assert.equal(await client.complete({ path: "a.bf", text: "a", offset: 1 }), null);
+  assert.equal(await client.diagnose({ path: "a.bf", text: "a" }), null);
+  assert.equal(await client.hover({ path: "a.bf", text: "a", offset: 0 }), null);
+  assert.equal(calls.filter((method) => method === "subsystem.list").length, 1, "one question, cached answer");
+  assert.equal(log.length, 1, "and one warning, not one per keystroke");
+  client.invalidate();
+  assert.equal(await client.diagnose({ path: "a.bf", text: "a" }), null);
+  assert.equal(calls.filter((method) => method === "subsystem.list").length, 2, "until something changes");
+  assert.throws(() => new LanguageClient({}), TypeError);
+});
+
+/* ------------------------------------------------------------------ */
+
+await Promise.all(pending);
 
 const passed = checks - failures.length;
 /*
