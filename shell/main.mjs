@@ -46,7 +46,7 @@ const WEB_DIR = path.join(SHELL_DIR, "web");
 const LANGS_DIR = path.join(ROOT, "langs");
 const SUBSYSTEMS_DIR = path.join(ROOT, "subsystems");
 
-const SHELL_VERSION = "0.4.1-alpha.1";
+const SHELL_VERSION = "0.4.2-alpha.1";
 const DEFAULT_KERNEL = process.platform === "win32"
   ? path.join(ROOT, "build", "seide.exe")
   : path.join(ROOT, "build", "seide");

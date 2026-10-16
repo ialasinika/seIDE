@@ -122,7 +122,7 @@ grep -rn "sde_proc" core/
 `seide modules` on this build prints exactly this:
 
 ```text
-seIDE kernel 0.3.0-alpha.1 -- 10 source modules
+seIDE kernel 0.4.2-alpha.1 -- 12 source modules
 To drop one: delete its line in the Makefile SRC list, its file
 under core/, and any method in rpc.c that calls it.
 
@@ -138,6 +138,10 @@ json     [required]
          JSON parse/serialise; the protocol's value type
          cut it and: nothing builds
 
+base64   [optional]
+         base64, for the byte strings a JSON string cannot carry
+         cut it and: binary bodies have no wire representation; text is unaffected
+
 port     [required]
          the platform boundary: files, paths, threads, processes
          cut it and: nothing builds; this is the layer a fork replaces to leave Win32
@@ -145,6 +149,10 @@ port     [required]
 wksp     [optional]
          workspace reads/writes, path containment, content revisions
          cut it and: files can no longer be opened or saved; only the canvas remains
+
+blob     [optional]
+         chunked binary and large-file sessions: read, append, atomic publish
+         cut it and: only whole text files under 4 MiB can be read or written
 
 view     [optional]
          the client's view document: opaque JSON, atomic persistence, revisions
@@ -177,16 +185,18 @@ are whole subsystems.
 | `buf` | required | growable byte buffer, the kernel's only string type | nothing builds: every other module formats through it |
 | `vec` | required | growable pointer array, used for lists without a fixed bound | nothing builds |
 | `json` | required | JSON parse/serialise; the protocol's value type | nothing builds |
+| `base64` | optional | base64, for the byte strings a JSON string cannot carry | binary bodies have no wire representation; text is unaffected |
 | `port` | required | the platform boundary: files, paths, threads, processes | nothing builds; this is the layer a fork replaces to leave Win32 |
 | `wksp` | optional | workspace reads/writes, path containment, content revisions | files can no longer be opened or saved; only the canvas remains |
+| `blob` | optional | chunked binary and large-file sessions: read, append, atomic publish | only whole text files under 4 MiB can be read or written |
 | `view` | optional | the client's view document: opaque JSON, atomic persistence, revisions | no document survives a restart; the client is left with what it holds |
 | `proc` | optional | child processes with a duplex channel, streamed to the client | nothing can start a process; runners and process subsystems stop |
 | `serve` | optional | newline-delimited JSON-RPC over stdin/stdout | the kernel has no way in; useful only as a linkable library |
 | `rpc` | required | the method table that turns frames into actions | nothing is callable; keep it and the kernel has no verbs |
 | `app` | required | constructs and owns the shared state modules are handed | nothing builds |
 
-Six required (`buf`, `vec`, `json`, `port`, `rpc`, `app`), four optional
-(`wksp`, `view`, `proc`, `serve`).
+Six required (`buf`, `vec`, `json`, `port`, `rpc`, `app`), six optional
+(`base64`, `wksp`, `blob`, `view`, `proc`, `serve`).
 
 ---
 
@@ -242,7 +252,9 @@ the `#if SDE_WITH_VIEW` block in `rpc.c`, and the view construction in `app.c`.
 
 Delete `core/src/wksp.c`, `core/include/wksp.h`, its `SRC` line, its table entry,
 and the `workspace.info` / `workspace.list` / `file.read` / `file.write` /
-`file.stat` methods plus their five table rows in `rpc.c`.
+`file.stat` methods plus their five table rows in `rpc.c`. `blob` is built on
+`wksp` (`sde_wksp_resolve` for every path, `wksp`'s revision helpers for the same
+numbers), so it goes with it: see the next section.
 
 - Protocol loses those five methods, the `file.changed` notification, and the
   `root` / `name` / `file_count` members of `workspace.info`.
@@ -256,6 +268,30 @@ and the `workspace.info` / `workspace.list` / `file.read` / `file.write` /
 - **Survives:** the board, links, notes, and the whole layout mechanism.
 - **Shell must change too:** yes — the `editor`, `search`, `files` and `project`
   card kinds have nothing to call, so all four renderers must go.
+
+### Cutting `blob` — text files only
+
+Delete `core/src/blob.c`, `core/include/blob.h`, its `SRC` line, its table entry,
+and the five `file.blobOpen` / `file.blobRead` / `file.blobAppend` /
+`file.blobCommit` / `file.blobAbort` handlers plus their table rows in `rpc.c`,
+plus the `blobs` field of `sde_app` and the two calls in `app.c`. `base64` exists
+only to carry a blob's bytes inside a JSON string, so it goes in the same cut
+(`core/src/base64.c`, `core/include/base64.h`, its `SRC` line and table entry);
+nothing else calls it.
+
+- Protocol loses those five methods. `file.changed` stays: it belongs to
+  `file.write`. `file.read`, `file.write` and `file.stat` keep their text rules
+  exactly as they were — the 4 MiB cap, and a refusal to read a file with a NUL
+  byte in it.
+- **Survives:** everything else — text files, the board, processes, the language
+  layer. A client that edits text notices nothing at all.
+- **Shell must change too:** no. The shell's editor, watcher, search and project
+  panels call `file.read`, `file.write` and `file.stat`; nothing in `shell/`
+  calls `file.blob*` yet.
+- **If you reimplement these methods elsewhere,** the housekeeping is part of
+  them: a write session owns `<path>.tmp`, and `blob.c` is what removes it — on
+  the next `file.blobOpen` of the same path (a kernel that died mid-session
+  leaves one behind), on `file.blobAbort`, and when the kernel frees the app.
 
 ### Cutting `serve` — a library, not a program
 
