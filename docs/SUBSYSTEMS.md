@@ -117,7 +117,7 @@ autostart, shared starts, failures, timeouts, stop-all), the four wire methods
 with notifications, the `words` builtin (word completion and three provable
 diagnostics, quieted by the tokenizer when `langs/` is present), the `lsp`
 adapter with a scripted server behind it, and the kernel's duplex channel. The
-suites are `node subsystems/selftest.mjs` (111 checks, no kernel, no browser, no
+suites are `node subsystems/selftest.mjs` (114 checks, no kernel, no browser, no
 network, including a real child running `lsp-stub.mjs`), `node shell/web/selftest.mjs`
 (130 checks of the client's language layer against fake channels) and `make test`,
 which drives the same descriptor through the shell and the real kernel.
@@ -130,8 +130,20 @@ launch node "{here}/lsp-stub.mjs"
 
 Replacing that line with `launch rust-analyzer` is the whole change; the wire
 code does not know what a Rust file is. The stub exists so the adapter has a
-server whose answers are predictable, not because a real one is unavailable —
-`rust-analyzer.exe` is on this machine.
+server whose answers are predictable, not because no real one could be run.
+
+A real one was run: `python-lsp-server` (`pylsp`), installed into
+`build/probe-tmp/pylsp` so nothing on this machine changed, answered through this
+same adapter over a real Python file -- `import` after typing `\nimpor`, a
+signature on hover, `def norm`'s line for a definition, and pyflakes' three
+complaints about a file with an unused import, an unused variable and an
+undefined name. Doing that found a real defect (a stopped subsystem could not be
+started again; `docs/BUGS.md`, N14) that the scripted server had hidden, which is
+the argument for testing against something that was not written to agree with
+you. `rust-analyzer` is *not* on this machine: `rust-analyzer.exe` in
+`~/.cargo/bin` is a rustup shim and the component is missing from both installed
+toolchains, so the Rust descriptor would need `rustup component add
+rust-analyzer` (or a different server) before it could run.
 
 The client side exists too: the editor card asks for completions on `^Space`
 (with `Enter`/arrows, and the answer's source named in the status line), shows

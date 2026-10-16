@@ -534,6 +534,45 @@ function processChannel(spec) {
 
   await host.stop("lsp");
   check("stopping the lsp subsystem leaves it stopped", host.state("lsp") === "stopped", host.state("lsp"));
+
+  // A stop is not the end of the subsystem: `autostart yes` means the next
+  // question starts a new server.  The exit event of the *old* server arrives
+  // after that new start, so it must not be allowed to fail the new life
+  // (docs/BUGS.md, N14).  Each step is caught, because a throw would end the
+  // run before it could name the check that broke.
+  let second = null;
+  try {
+    second = await host.request("lsp", "status");
+  } catch (err) {
+    second = { server: { running: false, command: null }, error: `${err}` };
+  }
+  check("a question after a stop starts the server again",
+    second.server.running === true && /lsp-stub/.test(String(second.server.command)),
+    JSON.stringify(second));
+
+  let again = null;
+  try {
+    again = await host.request("lsp", "complete", {
+      path: "examples/hello.bf",
+      text: "alpha = 1;\n",
+      offset: 6,
+    });
+  } catch (err) {
+    again = { error: `${err}` };
+  }
+  check("the second life answers completions too",
+    (again.items ?? []).some((item) => item.label === "alpha"),
+    JSON.stringify(again));
+
+  await host.stop("lsp");
+  let third = null;
+  try {
+    third = await host.request("lsp", "status");
+  } catch (err) {
+    third = { server: { running: false }, error: `${err}` };
+  }
+  check("a third life still runs", third.server.running === true, JSON.stringify(third));
+  await host.stop("lsp");
 }
 
 section("independence from the kernel");

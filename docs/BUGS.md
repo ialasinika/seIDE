@@ -374,6 +374,22 @@ live in `build/probes/subsystems/`: `FINDINGS.md`, `probe_lsp.mjs`,
   catching up.  `language.mjs`'s `diagnose` now asks again once with
   `wait: 2000` -- the adapter's own wait-for-version window -- keeps `stale` in
   the answer, and the strip's `data-answer` says so.
+- **N14 — a stopped subsystem could not be started again.** `autostart yes` means
+  a request after a stop starts a new server, and that is documented behaviour;
+  it threw `the language server exited (code null)` instead.  The exit callback
+  was a method on the adapter rather than on the channel
+  (`this.#channel.onExit((code) => this.#onExit(code))`), so the *old* server's
+  exit event -- which arrives *after* the new life has spawned its process and
+  registered its `initialize` -- rejected the new life's pending requests and set
+  `#channel = null` under it: the new server was running with nothing holding it.
+  The channel now travels with its own callbacks, and data or an exit from a
+  channel that is no longer in use is ignored; the lifecycle state
+  (`#exited`, stderr tail, framing reader, diagnostics cache) is reset per life,
+  and a stop resolves a question that was waiting on pushed diagnostics.  Three
+  checks in `subsystems/selftest.mjs` cover the stop → ask → stop → ask cycle and
+  fail without the guard.  Found by pointing the adapter at a real language
+  server (`pylsp`) after the 0.4.0-alpha.1 release; reproduced against the
+  shipped stub, which ruled the server out.
 
 ## Browser layer (`shell/web/`)
 

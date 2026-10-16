@@ -5,7 +5,11 @@
 # real protocol and needs nothing installed, so a fresh checkout works.
 # Replace it with one of these and restart the shell:
 #
-#     launch rust-analyzer
+#     launch python -m pylsp          (python-lsp-server; the one that has been
+#                                      run through this adapter end to end)
+#     launch rust-analyzer            (not installed on this machine: the
+#                                      ~/.cargo/bin shim needs the rustup
+#                                      component)
 #     launch clangd
 #     launch pyright-langserver --stdio
 #     launch typescript-language-server --stdio

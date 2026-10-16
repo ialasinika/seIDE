@@ -172,11 +172,19 @@ never answer from a stale document.  `lsp.sub` ships pointed at
 a real one is one line:
 
 ```
-launch node "{here}/lsp-stub.mjs"      # or: launch rust-analyzer
+launch node "{here}/lsp-stub.mjs"      # or: launch python -m pylsp
 ```
 
 `{here}` is the directory `lsp.mjs` lives in, so a descriptor can name its own
 script and still work from any workspace.
+
+The stub is not the only server this has been pointed at: `pylsp` (from
+`python-lsp-server`) answered through the same adapter -- real completions, a
+hover signature, a definition line, and pyflakes' diagnostics -- and doing that
+found a bug the scripted server could not (a stopped subsystem could not be
+started again; `docs/BUGS.md`, N14).  `rust-analyzer` is not installed on this
+machine; `rust-analyzer.exe` in `~/.cargo/bin` is a rustup shim whose component
+is missing.
 
 ## The built-in: `words`
 
@@ -206,11 +214,12 @@ bracket — and when it has been deleted the same rules run on raw text.
 node subsystems/selftest.mjs
 ```
 
-111 checks covering the descriptor grammar and its rejections, directory
+114 checks covering the descriptor grammar and its rejections, directory
 loading, the whole lifecycle (states, autostart, shared starts, failures,
-timeouts, stop-all), the channel seam, `words` completion and diagnostics
-(including the tokenizer's quieting), the `lsp` adapter's framing helpers, the
-same adapter against a **real child** running `lsp-stub.mjs` (a full
+timeouts, stop-all, and a stop followed by a question -- the old server's exit
+event must not fail the new life), the channel seam, `words` completion and
+diagnostics (including the tokenizer's quieting), the `lsp` adapter's framing
+helpers, the same adapter against a **real child** running `lsp-stub.mjs` (a full
 initialize → didOpen → completion/hover/definition/format → pushed diagnostics
-→ exit run), and the host's independence from the kernel.  It needs no kernel,
-no shell, no browser and no network.
+→ stop → start again → exit run), and the host's independence from the kernel.
+It needs no kernel, no shell, no browser and no network.

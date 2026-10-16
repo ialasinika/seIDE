@@ -246,12 +246,23 @@ class LspAdapter {
     const command = descriptor.launch.split("{here}").join(here);
     const root = this.#context.root;
 
-    this.#channel = this.#context.spawn({
+    // Everything below belongs to one life of the server.  A channel's own
+    // callbacks carry the channel, because the exit of a channel that has
+    // already been replaced must not touch the life that replaced it: a late
+    // `exit` event used to reject the new server's `initialize` and null out
+    // its channel, so a stop followed by a question could not be served
+    // (docs/BUGS.md, N14).
+    this.#exited = null;
+    this.#stderr = [];
+    this.#reader = new MessageReader();
+    this.#diagnostics.clear();
+    const channel = this.#context.spawn({
       command,
       cwd: root ?? process.cwd(),
     });
-    this.#channel.onOutput((data, stream) => this.#onData(data, stream));
-    this.#channel.onExit((code) => this.#onExit(code));
+    this.#channel = channel;
+    channel.onOutput((data, stream) => this.#onData(channel, data, stream));
+    channel.onExit((code) => this.#onExit(channel, code));
 
     const result = await this.#send("initialize", {
       processId: process.pid,
@@ -295,6 +306,13 @@ class LspAdapter {
       entry.reject(fail("the language server was stopped", "SUBSYSTEM_FAILED"));
     }
     this.#pending.clear();
+    // A question waiting on pushed diagnostics is answered with "nothing yet"
+    // rather than left to its own timer.
+    for (const waiter of [...this.#waits]) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(null);
+    }
+    this.#waits = [];
     this.#open.clear();
     channel.kill();
   }
@@ -482,7 +500,8 @@ class LspAdapter {
   /* the wire                                                         */
   /* ---------------------------------------------------------------- */
 
-  #onData(data, stream) {
+  #onData(channel, data, stream) {
+    if (channel !== this.#channel) return;
     if (stream === "stderr") {
       // Server chatter is not protocol.  Keep the tail for `status`, because
       // "why did it die" is almost always answered on stderr.
@@ -552,7 +571,10 @@ class LspAdapter {
     entry.resolve(message.result ?? null);
   }
 
-  #onExit(code) {
+  #onExit(channel, code) {
+    // The exit of a channel that is no longer the one in use is history, not
+    // news: it must not fail this life's requests or unhook its channel.
+    if (channel !== this.#channel) return;
     this.#exited = code ?? null;
     const tail = this.#stderr.slice(-3).join("");
     const reason = tail.trim() === "" ? "" : ` (stderr: ${tail.trim().split("\n").slice(-1)[0]})`;

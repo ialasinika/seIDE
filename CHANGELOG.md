@@ -3,6 +3,26 @@
 What changed, in the order it changed.  This project is a prototype: the
 version number says how usable it is, not how finished.
 
+## Unreleased
+### Subsystems
+
+- **A stopped subsystem can be started again.**  A request after
+  `subsystem.stop` is supposed to start a new server (`autostart yes`); instead
+  the exit event of the server that had just been stopped landed after the new
+  one had registered its `initialize` and failed it, leaving a running process
+  with no channel.  Found *after* `v0.4.0-alpha.1` was tagged, by pointing
+  `subsystems/lsp.mjs` at a real language server: `python-lsp-server` (`pylsp`)
+  answered completions, hover, a definition and pyflakes diagnostics through the
+  same wire the scripted stub uses, and then refused to start a second time.
+  The scripted stub reproduced it, which ruled the server out
+  (`docs/BUGS.md`, N14).  The fix keeps each channel's callbacks with that
+  channel and ignores a channel that is no longer in use; the lifecycle state is
+  reset per life, and a stop answers a question that was waiting on pushed
+  diagnostics.  `node subsystems/selftest.mjs` is 114 checks, three of them the
+  stop/ask/stop/ask cycle, and `build/probes/subsystems/sabotage_restart.mjs`
+  shows they fail without the guard.  The `v0.4.0-alpha.1` artifacts and tag are
+  unchanged; this is the next line.
+
 ## v0.4.0-alpha.1 — 2026-10-16
 ### Kernel
 
