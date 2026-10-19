@@ -533,10 +533,12 @@ scopes, both spelled out in [LICENSE-DOCS](LICENSE-DOCS).
 
 CI is [`.github/workflows/ci.yml`](.github/workflows/ci.yml): the `test` job runs
 the same `make CC=gcc test` a maintainer runs, and the `smoke` job renders the
-board headless.
+board headless.  Both jobs ran green on the first push (2026-10-19: test 57s,
+smoke 58s).
 [`.github/workflows/release.yml`](.github/workflows/release.yml) is the other
 half: a pushed tag in, a rebuilt release directory and a GitHub release out,
-with `tools/release.py --no-tag`. Neither file has run on a GitHub runner (they
-were authored on a machine with none), so treat them as unproven until the first
-green run; the commands inside them are exactly the ones in
+with `tools/release.py --no-tag`.  Its first tag run found two PowerShell
+argument bugs — an empty argument and a splatted scalar string — fixed in the
+two commits that follow it; its next run rebuilt `v0.4.2-alpha.1` from the tag
+and published it.  The commands inside both files are exactly the ones in
 [Run the checks](#run-the-checks).

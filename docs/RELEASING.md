@@ -115,8 +115,10 @@ python tools/release.py           # the real thing
    `dist/<version>/`, then `SHA256SUMS`, `RELEASE-NOTES.md` and
    `manifest.json` beside them.
 5. **tag** -- `git tag -a v<version>` on the release commit.  Nothing is pushed
-   unless `--push` is given, and this repository has no remote configured, so
-   today an alpha is a local archive, a local tag and a manifest that says so.
+   unless `--push` is given.  Once the tag is pushed,
+   `.github/workflows/release.yml` rebuilds that tag on a clean runner and
+   publishes the result; an alpha is still a local cut first, and the release
+   notes say what actually ran.
 
 Everything lands in `dist/<version>/` (git-ignored; it can be regenerated from
 the tag):
@@ -239,12 +241,13 @@ The board is never installed into the install directory: it is per-user state
 
 ## 7. What CI does
 
-Two workflow files, and neither of them has ever run on a GitHub runner:
+Two workflow files, both with GitHub runs behind them since 2026-10-19:
 
 - `.github/workflows/ci.yml` -- on every push: a `test` job runs `make CC=gcc`
   and `make CC=gcc test`, the same commands a maintainer runs, and a separate
   `smoke` job renders the board headless.  The smoke job is allowed to fail,
-  because a runner without a browser is not a defect in the release.
+  because a runner without a browser is not a defect in the release.  Both jobs
+  were green on the first push.
 - `.github/workflows/release.yml` -- on a pushed tag: it does **not** cut the
   release.  Cutting is local, because it dates the changelog, builds the
   artifacts and tags the commit.  A tag push takes the tag as given and does the
@@ -257,20 +260,33 @@ Two workflow files, and neither of them has ever run on a GitHub runner:
   `--no-tag` is what makes that possible: without it the run would refuse,
   because a release run is normally the thing that creates the tag.  It keeps
   the directory as a workflow artifact, and publishes it as a GitHub release --
-  `--prerelease` when `VERSION` carries a pre-release identifier.
+  `--prerelease` when `VERSION` carries a pre-release identifier.  It also has a
+  `workflow_dispatch` input `tag`, so an existing tag can be rebuilt without
+  moving it (`gh workflow run release.yml -f tag=v0.4.2-alpha.1`); that is how
+  the first release was published after its tag-push run exposed the two
+  PowerShell argument bugs fixed in the commits that followed.
 
-`git archive` of a commit is deterministic, so the source zip a tag push
-rebuilds should hash the same as the one cut on the maintainer's machine.  That
-equality is the only cross-check between the two machines, and it is why the
-source zip is the one artifact CI can prove rather than merely produce.
+`git archive` of a commit is deterministic except for one thing this pipeline
+learned the hard way: every zip entry carries the commit time in the archiving
+machine's local timezone.  The same commit therefore gave the +0800 local cut
+and the UTC CI rebuild two different hashes over identical entries with
+different timestamps.  `v0.4.2-alpha.1` was published before the fix: its tag
+annotation records the +0800 cut, its GitHub asset the UTC rebuild, two hashes
+over the same 131 entries.  `tools/release.py` now pins `TZ=UTC0` for
+`git archive`, so the same commit hashes the same on both machines; that
+equality is the cross-check between the two machines, and it is why the source
+zip is the one artifact CI can prove rather than merely produce.
 
 ## 8. What this pipeline does not claim
 
-- **Nothing has been pushed.**  No remote is configured; `--push` will fail
-  until one is.
-- **Neither GitHub workflow has run.**  `.github/workflows/ci.yml` and
-  `.github/workflows/release.yml` each say in their own header that they have not
-  been executed on a GitHub runner, and the release notes repeat it.
+- **Nothing is published from this machine by default.**  `--push` is opt-in.
+  The public repository is what a pushed branch and tag reach, and the release
+  workflow rebuilds a tag from there.
+- **The workflows have one real run history, not years of it.**  `ci.yml` was
+  green on its first push; `release.yml`'s first tag run failed in two
+  PowerShell argument spots (an empty argument and a splatted scalar string),
+  both fixed before it rebuilt and published `v0.4.2-alpha.1`.  The run history
+  in the repository is the record of which run proved what.
 - **No MSI has ever been built.**  No WiX and no `dotnet` on this machine;
   `tools/msi/README.md` states it plainly, and the WiX UI extension needs to be
   available to the WiX install before the first real build.

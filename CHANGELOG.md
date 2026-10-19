@@ -25,6 +25,15 @@ version number says how usable it is, not how finished.
   handed `D` instead of the zip's path (``no matches found for `D` ``).  `@( )`
   around the pipeline keeps it an array; the assets, the notes file and the
   tag are unchanged.
+- **The source zip hashes the same in every timezone.**  `git archive` stamps
+  every zip entry with the commit time in the archiving machine's local
+  timezone, so the +0800 cut of `v0.4.2-alpha.1` and the UTC CI rebuild had
+  different hashes over identical 131 entries (same names, CRCs and sizes).
+  `tools/release.py` now pins `TZ=UTC0` for `git archive`; rebuilding that tag
+  locally with the fix reproduces the published asset's SHA-256 `db30110f…`
+  byte for byte.  `v0.4.2-alpha.1` was published before the fix, so its tag
+  annotation still records the +0800 hash and its GitHub asset the UTC one;
+  `docs/RELEASING.md` says so.
 
 ## v0.4.2-alpha.1 — 2026-10-16
 ### Kernel

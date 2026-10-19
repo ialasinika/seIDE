@@ -156,9 +156,9 @@ def run(command, cwd=REPO_ROOT, capture: bool = True, timeout=None, env=None):
         raise ReleaseError(f"{shown} did not finish in {timeout}s", 2)
 
 
-def git(*args, capture: bool = True):
+def git(*args, capture: bool = True, env=None):
     """Run git in the repository root."""
-    return run([GIT, *args], capture=capture)
+    return run([GIT, *args], capture=capture, env=env)
 
 
 def git_text(*args) -> str:
@@ -394,9 +394,23 @@ def write_zip(dest: Path, items) -> dict:
 
 
 def source_archive(stem: str, version: str, rev: str, dest: Path) -> dict:
-    """The tagged tree itself, straight out of git (so it is exactly the tag)."""
+    """The tagged tree itself, straight out of git (so it is exactly the tag).
+
+    ``git archive`` stamps every zip entry with the commit time in the
+    archiving machine's local timezone, so the same commit produced two
+    different zips when the local cut (+0800) and the CI rebuild (UTC) were
+    compared: every entry's CRC matched but its timestamp did not.  Pin the
+    child's ``TZ`` to UTC so the bytes depend on the commit, not the machine.
+    (v0.4.2-alpha.1 was published before this pin; its tag annotation records
+    the +0800 cut and the GitHub asset the UTC rebuild, two hashes over the
+    same 131 entries.  See docs/RELEASING.md.)
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    code, output = git("archive", "--format=zip", f"--prefix={stem}-{version}/", "-o", str(dest), rev)
+    archive_env = dict(os.environ)
+    archive_env["TZ"] = "UTC0"
+    code, output = git(
+        "archive", "--format=zip", f"--prefix={stem}-{version}/", "-o", str(dest), rev, env=archive_env
+    )
     if code != 0:
         raise ReleaseError(f"git archive failed: {output.strip()}")
     return {"name": dest.name, "bytes": dest.stat().st_size, "sha256": file_sha256(dest)}
