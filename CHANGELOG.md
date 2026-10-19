@@ -45,6 +45,20 @@ version number says how usable it is, not how finished.
   and still contain the old string; they are immutable and carry no name
   beyond the path itself.
 
+### Releases
+
+- **A tag annotation describes a tag that exists.**  `release_notes()` ran
+  before `context["tagged"]` was set, so every annotated tag said `(NOT
+  created: --no-tag)` even though it was created (`v0.4.1-alpha.1` and
+  `v0.4.2-alpha.1` both shipped that text).  The message is rendered from a
+  copy that says the tag exists, before `git tag -a` runs.
+- **The notes stop claiming what the revision cannot know.**  A `--no-freeze`
+  run says whether the changelog section is still `## Unreleased` or already
+  `## v<version>` instead of assuming the former; a `--no-tag` run whose tag
+  already exists says so; the "workflows have never run" sentence points at the
+  repository's Actions tab instead; and a cut with no remote says it was not
+  pushed, in the past tense.
+
 ## v0.4.2-alpha.1 — 2026-10-16
 ### Kernel
 

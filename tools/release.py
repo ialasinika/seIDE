@@ -598,7 +598,13 @@ def release_notes(context: dict) -> str:
     lines.append("")
     lines.append(f"- channel: {channel}" + (" (the source archive only)" if channel == "alpha" else ""))
     lines.append(f"- commit: {context['base']['commit']} ({context['base']['date']})")
-    lines.append(f"- tag: {context['tag']}" + ("" if context["tagged"] else " (NOT created: --no-tag)"))
+    tag_line = f"- tag: {context['tag']}"
+    if not context["tagged"]:
+        if context.get("tag_existed"):
+            tag_line += " (this run did not create it: --no-tag; the tag already exists)"
+        else:
+            tag_line += " (NOT created: --no-tag)"
+    lines.append(tag_line)
     lines.append(f"- branch: {context['branch']}")
     if fork:
         data = context["fork_data"]
@@ -688,20 +694,27 @@ def release_notes(context: dict) -> str:
             f"`{context['branch']}`, and this one was cut from `{context['branch_now']}`."
         )
     if context["args"].no_freeze:
-        lines.append(
-            "- The changelog was not dated (`--no-freeze`): the section quoted below is still "
-            "`## Unreleased`."
-        )
+        top = changelog_top()
+        if top == "Unreleased":
+            lines.append(
+                "- The changelog was not dated (`--no-freeze`): the section quoted below is still "
+                "`## Unreleased`."
+            )
+        else:
+            lines.append(
+                "- The changelog was not re-dated (`--no-freeze`): the section quoted below is "
+                f"`## {top}`."
+            )
     if context["msi_note"]:
         lines.append(f"- {context['msi_note']}")
     lines.append(
-        "- The GitHub workflow files in this repository have never run on a GitHub runner; they "
-        "are written to call this same script."
+        "- The workflow files call this same script; their run history is the repository's "
+        "Actions tab, not a claim in these notes."
     )
     if not context["remotes"]:
         lines.append(
-            "- Nothing was pushed anywhere: this repository has no remote configured.  The "
-            "archive and the tag are local artifacts."
+            "- Nothing was pushed by this run (`--push` was not given) and no remote was "
+            "configured when it was cut: the archive and the tag are local artifacts."
         )
     lines.append("")
     lines.append("## How to reproduce this directory")
@@ -804,6 +817,7 @@ def plan(args, info: dict, channel: str) -> dict:
         "branch_now": branch,
         "branch_waived": False,
         "freeze_note": "",
+        "tag_existed": False,
     }
 
 
@@ -853,6 +867,7 @@ def preflight(context: dict) -> None:
 
     tag = context["tag"]
     code, _ = git("rev-parse", "-q", "--verify", f"refs/tags/{tag}")
+    context["tag_existed"] = code == 0
     if args.no_tag:
         # --no-tag says the tag is not this run's business.  That is the CI
         # case: the tag was pushed, and the runner is asked for the notes and
@@ -1020,7 +1035,12 @@ def tag_release(context: dict) -> None:
         print("[skip ] --no-tag: the artifacts exist, the release is not named")
         return
     context["base"] = commit_info("HEAD")
-    notes = release_notes(context)
+    # The annotation must describe a tag that exists.  The copy the notes are
+    # rendered from says so before `git tag -a` runs; rendering first is how
+    # every earlier annotation came to say "(NOT created: --no-tag)".
+    message_context = dict(context)
+    message_context["tagged"] = True
+    notes = release_notes(message_context)
     message_file = REPO_ROOT / "build" / "release-tag.txt"
     message_file.parent.mkdir(parents=True, exist_ok=True)
     write_text(message_file, f"{context['tag']}\n\n" + notes.split("## What was checked")[0].strip() + "\n")
