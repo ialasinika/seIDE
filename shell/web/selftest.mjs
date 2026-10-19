@@ -1475,7 +1475,7 @@ await testAsync("e2e: a real HTTP host, real SSE and real chunk boundaries", asy
       };
       switch (parsed.method) {
         case "hello":
-          reply({ ok: true, result: { protocol: "seide/2", kernel_version: "0.0.0-mock", root: "C:/codes/seIDE", pid: 4242 } });
+          reply({ ok: true, result: { protocol: "seide/2", kernel_version: "0.0.0-mock", root: "C:/work/seIDE", pid: 4242 } });
           return;
         case "view.load":
           // The client names the document it wants; the host answers with that

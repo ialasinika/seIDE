@@ -114,7 +114,7 @@ or mis-typing them produces `-32602 INVALID_PARAMS`.
 ### `hello`
 
 ```json
-{"protocol":3,"protocol_name":"seide/3","kernel_version":"0.3.0-alpha.1","root":"C:/codes/seIDE","pid":12345}
+{"protocol":3,"protocol_name":"seide/3","kernel_version":"0.3.0-alpha.1","root":"C:/work/seIDE","pid":12345}
 ```
 
 `protocol` is the integer a client can compare; `protocol_name` is the same
@@ -134,7 +134,7 @@ See `docs/VIEWS.md` for why that line is where it is.
 ### `workspace.info`
 
 ```json
-{"root":"C:/codes/seIDE","name":"seIDE","file_count":42,"view_path":".seide/board.json","view_revision":3901234567,"ignored":[".git",".seide",".hg",".svn","node_modules","__pycache__",".vscode",".idea",".cache","dist","build","target","obj"]}
+{"root":"C:/work/seIDE","name":"seIDE","file_count":42,"view_path":".seide/board.json","view_revision":3901234567,"ignored":[".git",".seide",".hg",".svn","node_modules","__pycache__",".vscode",".idea",".cache","dist","build","target","obj"]}
 ```
 
 `name` is the last path segment of `root`. `view_path` is the path of the

@@ -35,6 +35,16 @@ version number says how usable it is, not how finished.
   annotation still records the +0800 hash and its GitHub asset the UTC one;
   `docs/RELEASING.md` says so.
 
+### Docs
+
+- **The examples name a neutral workspace directory.**  `docs/PROJECT.md`,
+  `docs/PROTOCOL.md`, `shell/web/selftest.mjs` and `tools/browser_smoke.py`
+  showed a particular checkout path; they say `C:/work/seIDE` now, so a
+  published checkout does not name one machine's directory.  The
+  `v0.4.2-alpha.1` tag tree and its release asset were published before this
+  and still contain the old string; they are immutable and carry no name
+  beyond the path itself.
+
 ## v0.4.2-alpha.1 — 2026-10-16
 ### Kernel
 

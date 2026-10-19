@@ -21,7 +21,7 @@ project state.
 ## What it shows
 
 ```
-workspace — C:\codes\seIDE
+workspace — C:\work\seIDE
 [ **/*                       ] [ refresh ]
 
 OPEN · 2

@@ -127,7 +127,7 @@ READY_TEXT = "kernel ready"
 
 #: The two spellings of the boot log's workspace line.  ``main.mjs`` resolves
 #: the flag with Node's own path rules, which render Windows separators as
-#: forward slashes (``workspace C:/codes/seIDE``), while the flag a developer
+#: forward slashes (``workspace C:/work/seIDE``), while the flag a developer
 #: types -- and the one printed by ``serve`` -- keeps backslashes.  Both are the
 #: same root, so both count; see ``workspace_lines``.
 WORKSPACE_TEXTS = (
