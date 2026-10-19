@@ -3,6 +3,22 @@
 What changed, in the order it changed.  This project is a prototype: the
 version number says how usable it is, not how finished.
 
+## Unreleased
+
+### Build
+
+- **The release workflow can rebuild a tag without moving it, and no longer
+  passes an empty argument.**  Its first tag-push run (`v0.4.2-alpha.1`,
+  2026-10-19) failed at "Build the release directory from the tag": PowerShell
+  7.3+ forwards the empty `$forkArg` as an empty argument, and `release.py`
+  refused it as an unrecognized positional before doing anything (`usage error:
+  unrecognized arguments:`).  The step builds the argument list as an array
+  now, and a `workflow_dispatch` input `tag` lets the same run rebuild an
+  existing tag without moving it (`gh workflow run release.yml -f
+  tag=v0.4.2-alpha.1`).  The tag did not move; this is the workflow fix that
+  lets CI rebuild it.  `ci.yml`'s first run was green from the same push (test
+  57s, smoke 58s).
+
 ## v0.4.2-alpha.1 — 2026-10-16
 ### Kernel
 

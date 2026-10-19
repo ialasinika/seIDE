@@ -1,9 +1,11 @@
 # Rebuild a release where it was pushed.
 #
-# This file has never run on a GitHub runner.  It is written from the same
-# commands a local cut runs, and tools/release.py is the one implementation of
-# a release -- but until this workflow has a green run behind it, treat it as a
-# plan rather than a fact.  (Every release note says the same thing.)
+# This file first ran on a GitHub runner on 2026-10-19: the ci workflow's first
+# push was green, and the tag-push run of this file found one bug -- an empty
+# argument passed to release.py under PowerShell 7.3+ -- which is fixed below.
+# It is dispatchable now, so a tag can be rebuilt without moving it:
+#
+#   gh workflow run release.yml -f tag=v0.4.2-alpha.1
 #
 # It does NOT cut a release.  Cutting happens locally: tools/release.py commits
 # the changelog date, builds the artifacts, writes the notes and tags the
@@ -23,11 +25,20 @@ on:
     tags:
       - "v*"      # v0.2.0-alpha.2, v0.2.0-rc.1, v1.0.0
       - "*-v*"    # electron-example-v1.0.0 -- a fork's own tag
-  workflow_dispatch:   # re-run the whole thing against any ref
+  workflow_dispatch:   # rebuild any tag, or re-run the whole thing against a ref
+    inputs:
+      tag:
+        description: "Tag to rebuild (e.g. v0.4.2-alpha.1); defaults to the ref this workflow runs on"
+        required: false
+        type: string
 
 # gh release create uploads assets, which needs write access to contents.
 permissions:
   contents: write
+
+env:
+  # On a tag push that is the pushed tag; on workflow_dispatch it is the input.
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -37,6 +48,7 @@ jobs:
         with:
           # The tag, the commit it points at, and the history around them.
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: actions/setup-node@v4
         with:
@@ -64,7 +76,7 @@ jobs:
       - name: The tag names the version
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = $env:TAG
           # A fork carries its own name in front: electron-example-v1.0.0.
           $shown = $tag -replace '^.+?-v(\d)', 'v$1'
           $version = (Get-Content VERSION -Raw).Trim()
@@ -76,22 +88,26 @@ jobs:
       - name: Build the release directory from the tag
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = $env:TAG
           # A fork tag names the fork, and release.py rebuilds exactly that
-          # fork's bundle and delta.
+          # fork's bundle and delta.  Build the argument list instead of
+          # interpolating an empty string: PowerShell 7.3+ forwards "" as an
+          # empty positional, which argparse reports as "unrecognized
+          # arguments:" (this was the first tag-push run's failure).
           $fork = if ($tag -match '^(.+)-v\d') { $Matches[1] } else { "" }
-          $forkArg = if ($fork) { "--fork=$fork" } else { "" }
+          $releaseArgs = @('--no-tag', '--no-freeze', '--allow-branch')
+          if ($fork) { $releaseArgs += "--fork=$fork" }
           # --no-tag     : the tag exists; this run must not move it.
           # --no-freeze  : the changelog was dated when the tag was cut.
           # --allow-branch: a tag checkout is a detached HEAD, not `main`.
-          python tools/release.py --no-tag --no-freeze --allow-branch $forkArg
+          python tools/release.py @releaseArgs
 
       # If publishing below fails, the directory is still there to download.
       - name: Keep the release directory
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ github.ref_name }}
+          name: release-${{ inputs.tag || github.ref_name }}
           path: dist/**
 
       - name: Publish it as a GitHub release
@@ -100,7 +116,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $version = (Get-Content VERSION -Raw).Trim()
-          $tag = "${{ github.ref_name }}"
+          $tag = $env:TAG
           $notes = Get-ChildItem dist -Recurse -Filter RELEASE-NOTES.md | Select-Object -First 1
           $assets = Get-ChildItem dist -Recurse -File |
             Where-Object { $_.Extension -in ".zip", ".msi" } |
