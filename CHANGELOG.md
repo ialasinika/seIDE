@@ -18,6 +18,13 @@ version number says how usable it is, not how finished.
   tag=v0.4.2-alpha.1`).  The tag did not move; this is the workflow fix that
   lets CI rebuild it.  `ci.yml`'s first run was green from the same push (test
   57s, smoke 58s).
+- **The publish step builds its asset list as an array.**  The first dispatch
+  got past the build step and then failed in "Publish it as a GitHub release":
+  with one matching file the pipeline unrolls to a scalar string, and
+  PowerShell splatting a scalar string enumerates its characters, so `gh` was
+  handed `D` instead of the zip's path (``no matches found for `D` ``).  `@( )`
+  around the pipeline keeps it an array; the assets, the notes file and the
+  tag are unchanged.
 
 ## v0.4.2-alpha.1 — 2026-10-16
 ### Kernel

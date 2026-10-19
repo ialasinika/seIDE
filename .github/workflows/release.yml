@@ -118,9 +118,14 @@ jobs:
           $version = (Get-Content VERSION -Raw).Trim()
           $tag = $env:TAG
           $notes = Get-ChildItem dist -Recurse -Filter RELEASE-NOTES.md | Select-Object -First 1
-          $assets = Get-ChildItem dist -Recurse -File |
-            Where-Object { $_.Extension -in ".zip", ".msi" } |
-            ForEach-Object { $_.FullName }
+          # @() matters: a single match unrolls to a scalar string, and
+          # splatting a scalar string enumerates its characters -- the first
+          # dispatch passed "D" to gh and it said "no matches found for `D`".
+          $assets = @(
+            Get-ChildItem dist -Recurse -File |
+              Where-Object { $_.Extension -in ".zip", ".msi" } |
+              ForEach-Object { $_.FullName }
+          )
           # A pre-release identifier in VERSION is what makes it a pre-release.
           $kind = if ($version -match "-") { "--prerelease" } else { "--latest" }
           gh release create $tag @assets --title "seIDE $version" $kind `
